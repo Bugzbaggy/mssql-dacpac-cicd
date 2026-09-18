@@ -1,0 +1,47 @@
+name: Trigger Jenkins on PR Approval
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  trigger-jenkins:
+    if: github.event.review.state == 'approved'
+    runs-on: appdb-devops-general
+
+    steps:
+      - name: 🔍 Show PR context
+        run: |
+          echo "PR Number: ${{ github.event.pull_request.number }}"
+          echo "PR Branch: ${{ github.event.pull_request.head.ref }}"
+          echo "Target Branch: ${{ github.event.pull_request.base.ref }}"
+          echo "PR Head Commit: ${{ github.event.pull_request.head.sha }}"
+          echo "Approved by: ${{ github.event.review.user.login }}"
+
+      - name: Get Jenkins CSRF Crumb
+        id: crumb
+        run: |
+          CRUMB=$(curl -s -u "${{ secrets.JENKINS_USER }}:${{ secrets.JENKINS_API_TOKEN }}" \
+            "${{ secrets.JENKINS_URL }}/crumbIssuer/api/json" \
+            | jq -r '.crumb')
+          echo "crumb=$CRUMB" >> $GITHUB_OUTPUT
+
+      - name: 🚀 Trigger Jenkins Job
+        env:
+          JENKINS_URL: ${{ secrets.JENKINS_URL }}
+          JENKINS_JOB: ${{ secrets.JENKINS_JOB }}
+          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_API_TOKEN: ${{ secrets.JENKINS_API_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          GIT_COMMIT_HASH: ${{ github.event.pull_request.head.sha }}
+          APPROVED_BY: ${{ github.event.review.user.login }}
+        run: |
+          curl -X POST \
+            -u "$JENKINS_USER:$JENKINS_API_TOKEN" \
+            -H "Jenkins-Crumb:${{ steps.crumb.outputs.crumb }}" \
+            "$JENKINS_URL/job/$JENKINS_JOB/buildWithParameters" \
+            --data-urlencode "PR_NUMBER=$PR_NUMBER" \
+            --data-urlencode "PR_BRANCH=$PR_BRANCH" \
+            --data-urlencode "GIT_COMMIT_HASH=$GIT_COMMIT_HASH" \
+            --data-urlencode "APPROVED_BY=$APPROVED_BY"

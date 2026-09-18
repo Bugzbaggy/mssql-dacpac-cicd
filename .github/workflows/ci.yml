@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-demo:
+    name: Build demo database project
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0'
+      # global.json pins the SDK: Microsoft.Build.Sql 0.2.3-preview cannot be
+      # built by SDK 10, and without a pin the runner picks its newest SDK.
+      - name: Show resolved SDK
+        run: dotnet --version
+      - name: Build DemoDb
+        run: dotnet build demo/DemoDb/DemoDb.sqlproj --nologo
+
+  gates:
+    name: Pipeline gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: sqlproj coverage
+        shell: pwsh
+        # -ProjectDir takes the FOLDER containing the .sqlproj
+        run: ./deploy/Validate-SqlprojCoverage.ps1 -ProjectDir demo/DemoDb
+
+      # Flyway_Validate_Migration_Order.ps1 is a Jenkins-only script: it takes no
+      # parameters and connects to a live staging database. It cannot run here, so
+      # CI performs the DB-free half of that gate — migration version ordering.
+      - name: Migration version order
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem Migration/DemoDb -Filter '*.sql' | Sort-Object Name
+          if (-not $files) { Write-Host 'No migrations to check.'; exit 0 }
+          $bad = $false
+          $seen = @{}
+          foreach ($f in $files) {
+            if ($f.Name -notmatch '^V(\d+)\.(\d+)(?:\.(\d+))?__[A-Za-z0-9_]+\.sql$') {
+              Write-Host "::error file=$($f.Name)::does not match V<major>.<minor>[.<patch>]__name.sql"
+              $bad = $true; continue
+            }
+            $patch = if ($Matches[3]) { $Matches[3] } else { '0' }
+            $v = [version]("$($Matches[1]).$($Matches[2]).$patch")
+            if ($seen.ContainsKey($v)) {
+              Write-Host "::error file=$($f.Name)::duplicate version $v"
+              $bad = $true
+            }
+            $seen[$v] = $f.Name
+          }
+          $ordered = $seen.Keys | Sort-Object
+          Write-Host "Migrations in order: $($ordered -join ', ')"
+          if ($bad) { exit 1 }
+          Write-Host 'Migration order OK.'
+
+      - name: PowerShell parses
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Include *.ps1 | ForEach-Object {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$errs)
+            if ($errs) { Write-Host "::error file=$($_.Name)::$($errs[0].Message)"; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+          Write-Host 'All scripts parsed.'
+
+  leak-scan:
+    name: No internal identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan
+        run: bash ci/leak-scan.sh

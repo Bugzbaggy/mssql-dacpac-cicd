@@ -1,0 +1,105 @@
+################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+*.dbmdl
+*.jfm
+.vs
+.DS_Store
+nul
+
+#Ignore thumbnails created by Windows
+Thumbs.db
+
+#Ignore files built by Visual Studio
+*.obj
+*.exe
+*.pdb
+*.user
+*.aps
+*.pch
+*.vspscc
+*_i.c
+*_p.c
+*.ncb
+*.suo
+*.tlb
+*.tlh
+*.bak
+*.cache
+*.ilk
+*.log
+[Bb]in
+[Dd]ebug*/
+*.lib
+*.sbr
+obj/
+[Rr]elease*/
+_ReSharper*/
+[Tt]est[Rr]esult*
+.vs/
+*.dacpac
+# Exception: Allow external reference dacpac files
+!AppDb_Analytics/external-refs/*.dacpac
+
+# Large media files
+*.mp4
+*.tiff
+*.avi
+*.flv
+*.mov
+*.wmv
+
+
+
+
+/AppDb_Analytics/AppDb_Analytics.dbmdl
+/AppDb_Analytics/AppDb_Analytics.jfm
+/AppDb_Analytics/bin/Debug/AppDb_Analytics.sql
+#Nuget packages folder
+packages/
+/AppDb_Analytics/AppDb_Analytics.sqlproj.user
+/AppDb_Analytics/bin/Debug/
+/AppDb_Analytics/bin/Debug/master.dacpac
+/AppDb_Analytics/bin/Debug/msdb.dacpac
+/AppDb_Analytics/bin/Debug/AppDb_Analytics.dacpac
+/AppDb_Analytics/bin/Debug/AppDb_Analytics.dll
+/AppDb_Analytics/bin/Debug/AppDb_Analytics.pdb
+/AppDb_Analytics/bin/Debug/AppDb_MSG.dacpac
+/AppDb_Analytics/bin/Debug/AppDb_Voice.dacpac
+/AppDb_Analytics/.vs/wc-analytics-db/v16/.suo
+/AppDb_Analytics/.vs/wc-analytics/v16/.suo
+/AppDb_Analytics/obj/Debug/Model.xml
+/.claude/settings.local.json
+
+# ---- secrets & environment (added by scaffold) ----
+.env
+.env.*
+!.env.example
+fleet.json
+*.pfx
+*.key
+*.pem
+secrets.json
+appsettings.*.local.json
+
+# ---- build output that can embed identifiers ----
+dist/
+build/
+out/
+node_modules/
+__pycache__/
+*.dacpac
+*.exe
+*.blob
+
+# ---- editor / OS ----
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent scratch (SDD progress notes, task reports). Never commit: this directory
+# is excluded from ci/leak-scan.sh, so nothing in it is ever checked.
+.superpowers/

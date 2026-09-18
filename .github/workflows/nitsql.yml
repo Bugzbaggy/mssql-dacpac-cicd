@@ -1,0 +1,146 @@
+name: nitsql
+
+# Authoritative SQL gate. Runs the vendored nitsql analyzer
+# (.githooks/analyze_sql.py) against changed *.sql files on every PR and
+# every push to master. CRITICAL findings fail the job — this is the
+# enforcement that does NOT depend on developers installing the local
+# pre-commit hook.
+
+on:
+  pull_request:
+    paths:
+      - '**/*.sql'
+      - '.githooks/analyze_sql.py'
+      - '.github/workflows/nitsql.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - '**/*.sql'
+      - '.githooks/analyze_sql.py'
+      - '.github/workflows/nitsql.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analyze:
+    name: Analyze staged SQL
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Determine changed *.sql files
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE_SHA="${{ github.event.pull_request.base.sha }}"
+            HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE_SHA="${{ github.event.before }}"
+            HEAD_SHA="${{ github.sha }}"
+          fi
+
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            FILES=$(git ls-files '*.sql')
+          else
+            FILES=$(git diff --name-only --diff-filter=AMR "$BASE_SHA" "$HEAD_SHA" -- '*.sql')
+          fi
+
+          if [ -z "$FILES" ]; then
+            echo "no_files=true" >> "$GITHUB_OUTPUT"
+            echo "No SQL files changed — nothing to analyze."
+          else
+            echo "no_files=false" >> "$GITHUB_OUTPUT"
+            echo "$FILES" > "$RUNNER_TEMP/sql_files.txt"
+            COUNT=$(wc -l < "$RUNNER_TEMP/sql_files.txt")
+            echo "Found $COUNT changed SQL file(s)."
+          fi
+
+      - name: Verify analyzer is vendored
+        if: steps.changed.outputs.no_files == 'false'
+        shell: bash
+        run: |
+          if [ ! -f .githooks/analyze_sql.py ]; then
+            echo "::error::.githooks/analyze_sql.py missing — repository drift from nitsql v6.0.0+."
+            echo "Restore by running the sync-skill-config workflow or copying it from the marketplace."
+            exit 1
+          fi
+
+      - name: Run nitsql analyzer
+        if: steps.changed.outputs.no_files == 'false'
+        id: analyze
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < "$RUNNER_TEMP/sql_files.txt"
+          echo "Analyzing ${#FILES[@]} file(s):"
+          printf '  %s\n' "${FILES[@]}"
+          echo ""
+
+          set +e
+          python .githooks/analyze_sql.py --json "${FILES[@]}" > "$RUNNER_TEMP/sql_valid8.json"
+          ANALYZER_EXIT=$?
+          set -e
+
+          echo "────────────────────────────────────────────────────────────"
+          python .githooks/analyze_sql.py --fix "${FILES[@]}" || true
+          echo "────────────────────────────────────────────────────────────"
+
+          read TOTAL CRIT HIGH MED LOW <<<"$(python -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          c = d.get("severity_counts", {})
+          print(d.get("total_violations", 0), c.get("CRITICAL", 0), c.get("HIGH", 0), c.get("MEDIUM", 0), c.get("LOW", 0))
+          ' "$RUNNER_TEMP/sql_valid8.json")"
+
+          {
+            echo "total=$TOTAL"
+            echo "critical=$CRIT"
+            echo "high=$HIGH"
+            echo "medium=$MED"
+            echo "low=$LOW"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## nitsql results"
+            echo ""
+            echo "| Severity | Count |"
+            echo "| -------- | ----- |"
+            echo "| CRITICAL | $CRIT |"
+            echo "| HIGH     | $HIGH |"
+            echo "| MEDIUM   | $MED  |"
+            echo "| LOW      | $LOW  |"
+            echo "| **Total**| **$TOTAL** |"
+            echo ""
+            if [ "$CRIT" -gt 0 ]; then
+              echo "**Status:** :x: BLOCKED — $CRIT CRITICAL finding(s)."
+            elif [ "$TOTAL" -gt 0 ]; then
+              echo "**Status:** :warning: $TOTAL non-critical finding(s) — merge allowed."
+            else
+              echo "**Status:** :white_check_mark: All clean."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CRIT" -gt 0 ]; then
+            echo "::error::nitsql BLOCKED — $CRIT CRITICAL finding(s) in changed SQL."
+            exit 1
+          fi
+
+      - name: All clean
+        if: steps.changed.outputs.no_files == 'true'
+        shell: bash
+        run: echo "No SQL files in this change — nitsql skipped."

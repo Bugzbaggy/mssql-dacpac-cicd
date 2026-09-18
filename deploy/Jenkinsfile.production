@@ -1,0 +1,357 @@
+pipeline {
+  environment {
+    REPO_NAME = 'appdb-analytics-db'
+    GITHUB_TOKEN_CREDENTIALS_ID = "ci-bot"
+    // ---- PolicyGate release governance ----
+    POLICYGATE_API_KEY = credentials('POLICYGATE_API_KEY')
+    POLICYGATE_DOMAIN  = "policygate.example.com"
+    POLICYGATE_ENV     = "production"
+    DEPLOYMENT_APPROVERS = 'approver1,approver2,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com'
+    SLACK_CHANNEL = "eng_db_ci"
+    SERVICE_NAME = "AppDb_ANALYTICS"
+  }
+
+  parameters {
+    string(name: 'RP_TICKET', defaultValue: '', description: 'RP (Release Plan) ticket; auto-detected from PolicyGate when blank')
+    booleanParam(name: 'FAST_TRACK', defaultValue: true, description: 'Deploy with FastTrack (records gate but skips RP-review wait)')
+    booleanParam(name: 'POLICYGATE_DEBUG', defaultValue: false, description: 'Enable PolicyGate debug behaviour')
+  }
+  agent {
+    node ("dev-win-slave1")
+  }
+
+  options {
+    skipStagesAfterUnstable()
+    buildDiscarder(logRotator(daysToKeepStr: '7'))
+    retry(1)
+    timestamps()
+    // Serialize builds of this job so Jenkins never spins up a numbered workspace
+    // (e.g. "...master@2"). A numbered workspace previously defeated the deploy
+    // script's folder lookup and caused a stale checkout to deploy silently.
+    disableConcurrentBuilds()
+  }
+
+  stages {
+
+ stage('Checkout') {
+      steps {
+        script{
+           try {
+             checkout scm
+             echo "${currentBuild.buildCauses}"
+           } catch(error) {
+               echo "First build failed, let's retry if accepted"
+               retry(1) 
+          }
+        }
+      }
+    }
+
+    stage('🔎 Extract Merge Info') {
+      steps {
+        script {
+
+          env.COMMIT_MESSAGE = powershell(
+            script: "git log -1 --pretty=%B",
+            returnStdout: true
+          ).trim()
+
+          env.COMMIT_AUTHOR = powershell(
+            script: "git log -1 --pretty=%an",
+            returnStdout: true
+          ).trim()
+
+          env.SHORT_COMMIT = powershell(
+            script: "git rev-parse --short HEAD",
+            returnStdout: true
+          ).trim()
+
+          def prInfo = getGitHubPRInfo(
+            env.REPO_NAME,
+            env.COMMIT_MESSAGE,
+            GITHUB_TOKEN_CREDENTIALS_ID
+          )
+
+          env.PR_NUMBER = prInfo.prNumber
+          env.MERGED_BRANCH = prInfo.mergedBranch
+          env.PR_TITLE = prInfo.prTitle
+
+          echo "PR Number: ${env.PR_NUMBER}"
+          echo "Merged branch: ${env.MERGED_BRANCH}"
+          echo "PR Title: ${env.PR_TITLE}"
+
+          env.RELEASE_ID = "${env.BUILD_ID}_${env.JOB_NAME}"
+          // Surface whether the PolicyGate credential resolved in this Jenkins folder
+          powershell label: 'PolicyGate credential check', script: 'Write-Host "POLICYGATE_API_KEY is set: $([bool]$env:POLICYGATE_API_KEY)"'
+        }
+      }
+    }
+    stage('🛡️ PolicyGate Pre-Release') {
+      steps {
+        script {
+          def result = runPolicyGateGate('pre-release', true)
+          if (!params.RP_TICKET && result?.rpTicket) {
+            echo "PolicyGate identified RP ticket: ${result.rpTicket}"
+            env.RP_TICKET = result.rpTicket
+          }
+          // PolicyGate is used for deployment tracking; under FastTrack the RP/release
+          // flow is skipped, so a pre-release DENY is recorded but must not block
+          // the production deploy. (Pre-Deploy below remains the enforcement gate.)
+          if (params.FAST_TRACK) {
+            echo "PolicyGate Pre-Release signal: ${result?.signal ?: 'UNKNOWN'} (FastTrack on - recorded, not blocking)"
+          } else {
+            checkPolicyGateSignal(result, 'Pre-Release')
+          }
+        }
+      }
+    }
+    stage('✋ Deployment Approval') {
+      steps {
+        setBuildStatus("pending")
+         wrap([$class: 'BuildUser']) {
+          script {
+            slackSend channel: "#${SLACK_CHANNEL}",
+                      color: 'warning',
+                      tokenCredentialId: "slack_token_eng_db_ci",
+                      message: """⚠️ *PRODUCTION Deployment Approval Required*
+Service: `${SERVICE_NAME}`
+Requested by: `${BUILD_USER}`
+PR: #${env.PR_NUMBER} / ${env.PR_TITLE}
+Merged Branch: `${env.MERGED_BRANCH}`
+Commit: `${env.SHORT_COMMIT}`
+Author: `${env.COMMIT_AUTHOR}`
+Commit Message:
+${env.COMMIT_MESSAGE}
+Job: ${env.JOB_URL}
+@here"""
+          }
+        }
+
+        script {
+          timeout(time:2, unit:'DAYS') {
+            script {
+              approvedBy = input(
+                message: "Deploy to PRODUCTION environment?",
+                submitter: env.DEPLOYMENT_APPROVERS,
+                submitterParameter: "approver",
+                ok: "DEPLOY"
+              )
+              echo "Deployment approved by: ${approvedBy}"
+            }
+          }
+        }
+      }
+    }
+
+    stage('🛡️ PolicyGate Pre-Deploy') {
+      steps {
+        script {
+          def result = runPolicyGateGate('pre-deploy', true)
+          checkPolicyGateSignal(result, 'Pre-Deploy')
+        }
+      }
+    }
+    stage("🔨 Run Migration PRODUCTION") {
+      steps {
+        echo "Proceeding with deployment as approved by: ${approvedBy}"
+        
+        dir("${env.WORKSPACE}/deploy"){
+          withCredentials([[$class: 'UsernamePasswordMultiBinding',
+                           credentialsId: 'app_db_jenkins',
+                           usernameVariable: 'USER',
+                           passwordVariable: 'PASS' ]] ){          
+            
+            echo "Starting Flyway deployment script..."
+            powershell """
+                       powershell.exe -nologo -file 'Flyway_PRD_Deploy.ps1' -WindowStyle Hidden -username "$Env:USER" -password "$Env:PASS"
+            """
+            
+            // Verify deployment completed
+            powershell "dir ../Migration"
+            echo "Migration deployment completed"
+          }
+        }
+      }
+    }
+
+    stage('📋 Post-Deployment Summary') {
+      steps {
+        script {
+          echo "=== Deployment Summary ==="
+          echo "Approved by: ${approvedBy}"
+          echo "Build Number: ${BUILD_NUMBER}"
+          echo "Deployment completed at: ${new Date()}"
+        }
+      }
+    }
+  }
+
+  post {
+    cleanup {
+          cleanTempDir()
+    }
+
+    success {
+      setBuildStatus("success")
+      script {
+        echo "Pipeline completed successfully. Database migration deployed to PRODUCTION."
+        // Maybe send a notification here?
+
+        wrap([$class: 'BuildUser']) {
+        script {
+        slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'good',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME} > *PRODUCTION* Migration stages completed successfully by `${BUILD_USER}` ✅\n@here"
+        }
+      }
+    }
+      script {
+        if (env.RELEASE_ID) {
+          runPolicyGateGate('post-deploy', true)
+          runPolicyGateGate('post-release', true)
+        }
+      }
+   }
+
+   failure {
+      setBuildStatus("failure")
+      script {
+        echo "Pipeline failed. Check logs for details."
+        // Definitely want notifications on failure
+        slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'danger',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME} > *PRODUCTION* Migration failed - check logs for details ❌\n@here attention required"
+      }
+      script {
+        if (env.RELEASE_ID) {
+          runPolicyGateGate('post-deploy', false)
+          runPolicyGateGate('post-release', false)
+        }
+      }
+    }
+
+  }
+}
+
+def cleanTempDir(){
+  cleanWs()
+  dir("${WORKSPACE}@tmp"){
+    deleteDir()
+  }
+  dir("${WORKSPACE}@script"){
+    deleteDir()
+  }
+  dir("${WORKSPACE}@script@tmp") {
+    deleteDir()
+  }
+}
+
+private boolean lastCommitIsBumpCommit() {
+    lastCommit = powershell(script: 'git log -1', returnStdout: true)
+    println lastCommit
+    if (lastCommit.contains("SKIP-CI")) {
+        return true
+    } else {
+        return false
+    }
+}
+
+private boolean checkCommitIsPR() {
+    println env.CHANGE_ID
+    if (env.CHANGE_ID != null) {
+        return true
+    } else {
+        return false
+    }
+}
+
+def setBuildStatus(String state) {
+  String url = "https://api.github.com/repos/example/${env.REPO_NAME}/statuses/${env.GIT_COMMIT}"
+  String context = "Jenkins build"
+  String description = getDescription(state)
+  def payload = """
+              {
+                "target_url": "${env.JOB_URL}", 
+                "state": "${state}",
+                "description": "${description}",
+                "context": "${context}"
+              }"""
+
+  withCredentials([usernamePassword(credentialsId: 'ci-bot', usernameVariable: 'APP_ID', passwordVariable: 'KEY')]) {
+      def response = httpRequest contentType: 'APPLICATION_JSON',
+                             customHeaders: [[name: 'Accept', value: 'application/vnd.github.v3+json'], [name:'Authorization', value:"Bearer ${KEY}"]],
+                             httpMode: 'POST',
+                             requestBody: "${payload}",
+                             url: "${url}"
+  println('Status: '+response.status)
+  println('Response: '+response.content)
+  }
+}
+
+def getGitHubPRInfo(repoName, commitMessage, credentialsId) {
+  def result = [
+    prNumber: "N/A",
+    mergedBranch: "unknown",
+    prTitle: "N/A"
+  ]
+  def prMatch = commitMessage =~ /#(\d+)/
+  if (prMatch) {
+    result.prNumber = prMatch[0][1]
+  } else {
+    return result
+  }
+  prMatch = null  // CRITICAL: Release non-serializable Matcher before CPS step
+
+  withCredentials([usernamePassword(credentialsId: credentialsId, usernameVariable: 'APP_ID', passwordVariable: 'GITHUB_TOKEN')]) {
+    def apiUrl = "https://api.github.com/repos/example/${repoName}/pulls/${result.prNumber}"
+    def response = powershell(
+      script: 'curl.exe -s -H "Authorization: Bearer $Env:GITHUB_TOKEN" ' + apiUrl,
+      returnStdout: true
+    ).trim()
+    if (response) {
+      def json = readJSON text: response
+      if (json?.head?.ref) {
+        result.mergedBranch = json.head.ref
+      }
+      if (json?.title) {
+        result.prTitle = json.title
+      }
+    }
+  }
+  return result
+}
+def getDescription(String state) {
+  switch(state) {
+    case "pending":
+      return "Build in-progress"
+    case "success":
+      return "Build succeeded"
+    case "failure":
+      return "Build failed"
+    default:
+      return null
+  }
+}
+
+// ---- PolicyGate (Windows/PowerShell-native gate client) ----
+def runPolicyGateGate(String phase, boolean success) {
+  def resultFile = "policygate_${phase}.json"
+  def ft         = params.FAST_TRACK ? 'true' : 'false'
+  def succ       = success ? 'true' : 'false'
+  def version    = env.SHORT_COMMIT ?: env.GIT_COMMIT ?: env.BUILD_NUMBER
+  def repoUrl    = "https://github.com/example/${env.REPO_NAME}"
+  def scriptPath = "${env.WORKSPACE}/deploy/PolicyGate-Gate.ps1"
+  powershell label: "PolicyGate ${phase}",
+    script: "Set-ExecutionPolicy Bypass -Scope Process -Force; & '${scriptPath}' -Phase '${phase}' -Environment '${env.POLICYGATE_ENV}' -ReleaseId '${env.RELEASE_ID}' -ServiceName '${env.SERVICE_NAME}' -Version '${version}' -Ticket '${env.RP_TICKET ?: ''}' -FastTrack '${ft}' -Success '${succ}' -GitCommit '${env.GIT_COMMIT ?: ''}' -GitBranch '${env.MERGED_BRANCH ?: ''}' -GitRepo '${repoUrl}' -BuildNumber '${env.BUILD_NUMBER ?: ''}' -BuildUrl '${env.BUILD_URL ?: ''}' -JobName '${env.JOB_NAME ?: ''}' -RequestedBy '${env.BUILD_USER_ID ?: 'jenkins'}' -PolicyGateDomain '${env.POLICYGATE_DOMAIN}' -ResultFile '${resultFile}'"
+  return readJSON(file: resultFile)
+}
+
+def checkPolicyGateSignal(result, String stage) {
+  def signal = result?.signal ?: 'UNKNOWN'
+  if (signal == 'DENY') {
+    error("PolicyGate ${stage} gate returned DENY — deployment blocked")
+  }
+  echo "PolicyGate ${stage} gate signal: ${signal}"
+}

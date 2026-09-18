@@ -1,0 +1,613 @@
+def approvalStatus = false
+def skipBuild = false
+
+// Helper function to get safe branch name for workspace
+@NonCPS
+def getSafeBranchName() {
+  return params.PR_BRANCH ?: env.CHANGE_BRANCH ?: 'default-branch'
+}
+
+pipeline {
+  
+  parameters {
+    string(name: 'PR_NUMBER', defaultValue: '', description: 'Pull Request Number')
+    string(name: 'PR_BRANCH', defaultValue: '', description: 'Pull Request Branch Name')
+    string(name: 'GIT_COMMIT_HASH', defaultValue: '', description: 'Git Commit Hash')
+  }
+    
+  environment {
+    SLACK_CHANNEL = "eng_db_ci" //channelId of eng_db_ci       
+    SERVICE_NAME = "AppDb_ANALYTICS"
+    REPO_NAME = 'appdb-analytics-db'
+    GITHUB_TOKEN_CREDENTIALS_ID = "ci-bot"
+    DEPLOYMENT_APPROVERS = 'approver1,approver2,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com'
+    DB_NAME = "AppDb_Analytics"
+    REPO = "example/appdb-analytics-db"
+    
+    // Use parameters if available, otherwise fall back to env vars
+    EFFECTIVE_PR_NUMBER = "${params.PR_NUMBER ?: env.CHANGE_ID ?: ''}"
+    EFFECTIVE_PR_BRANCH = "${params.PR_BRANCH ?: env.CHANGE_BRANCH ?: ''}"
+    EFFECTIVE_GIT_COMMIT = "${params.GIT_COMMIT_HASH ?: env.GIT_COMMIT ?: ''}"
+  }
+  
+  agent {
+    node {
+        label "dev-win-slave1"
+        // Use inline ternary that Jenkins can evaluate at agent allocation time
+        // Folder name must be filesystem-safe: normalize '/' -> '.' so a branch like
+        // feature/PROJ-000 yields a single workspace dir (no nesting) and matches the
+        // dotted branch token in the generated migration filenames. Checkout/push still
+        // use the raw EFFECTIVE_PR_BRANCH below.
+        customWorkspace "workspace/AppDb_Analytics_STG_MGR_${(env.PR_BRANCH ?: (env.CHANGE_BRANCH ?: 'manual')).replaceAll('/', '.')}"
+    }
+  }
+  
+  options {
+    skipStagesAfterUnstable()
+    buildDiscarder(logRotator(daysToKeepStr: '7'))
+    disableConcurrentBuilds()
+    copyArtifactPermission('*')
+  }
+  
+  stages {
+    stage('⏱️ Initial Delay') {
+      steps {
+        script {
+          echo "Waiting 10 seconds before starting migration pipeline..."
+          sleep(time: 10, unit: 'SECONDS')
+          echo "Delay complete - proceeding with migration"
+        }
+      }
+    }
+    
+    stage('🔍 Validate Input Parameters') {
+      steps {
+        script {
+          echo "═══════════════════════════════════════"
+          echo "Pipeline Input Validation"
+          echo "═══════════════════════════════════════"
+          echo "PR Number (param): ${params.PR_NUMBER}"
+          echo "PR Branch (param): ${params.PR_BRANCH}"
+          echo "GIT Commit (param): ${params.GIT_COMMIT_HASH}"
+          echo "───────────────────────────────────────"
+          echo "CHANGE_ID (env): ${env.CHANGE_ID ?: 'N/A'}"
+          echo "CHANGE_BRANCH (env): ${env.CHANGE_BRANCH ?: 'N/A'}"
+          echo "GIT_COMMIT (env): ${env.GIT_COMMIT ?: 'N/A'}"
+          echo "───────────────────────────────────────"
+          echo "EFFECTIVE_PR_NUMBER: ${env.EFFECTIVE_PR_NUMBER}"
+          echo "EFFECTIVE_PR_BRANCH: ${env.EFFECTIVE_PR_BRANCH}"
+          echo "EFFECTIVE_GIT_COMMIT: ${env.EFFECTIVE_GIT_COMMIT}"
+          echo "───────────────────────────────────────"
+          echo "Workspace: ${env.WORKSPACE}"
+          echo "═══════════════════════════════════════"
+          
+          if (!env.EFFECTIVE_PR_NUMBER || !env.EFFECTIVE_PR_BRANCH) {
+            error("❌ Missing required parameters: PR_NUMBER and PR_BRANCH must be provided")
+          }
+          
+          echo "✅ All required parameters validated"
+        }
+      }
+    }
+
+    stage('🛑 Stop If PR Already Merged') {
+      steps {
+        script {
+          // A merged PR has nothing left to stage and must not re-trigger the
+          // deployment job (that is the source of the run-after-run loop).
+          // Fail fast here so the 'Trigger Staging Deployment Pipeline' stage
+          // is never reached. Fail-open only on API errors, never on a
+          // confirmed merge.
+          def merged = false
+          if (env.EFFECTIVE_PR_NUMBER) {
+            try {
+              withCredentials([usernamePassword(credentialsId: env.GITHUB_TOKEN_CREDENTIALS_ID, usernameVariable: 'APP_ID', passwordVariable: 'KEY')]) {
+                def resp = httpRequest(
+                  httpMode: 'GET',
+                  url: "https://api.github.com/repos/example/${env.REPO_NAME}/pulls/${env.EFFECTIVE_PR_NUMBER}",
+                  customHeaders: [
+                    [name: 'Accept', value: 'application/vnd.github.v3+json'],
+                    [name: 'Authorization', value: "Bearer ${KEY}", maskValue: true]
+                  ],
+                  validResponseCodes: '200:404'
+                )
+                if (resp.status == 200) {
+                  def pr = readJSON(text: resp.content)
+                  merged = (pr.merged == true)
+                  echo "PR #${env.EFFECTIVE_PR_NUMBER}: state=${pr.state}, merged=${pr.merged}"
+                } else {
+                  echo "⚠️ PR #${env.EFFECTIVE_PR_NUMBER} lookup returned HTTP ${resp.status} - proceeding (fail-open)."
+                }
+              }
+            } catch (Exception e) {
+              echo "⚠️ Could not verify PR merge state (${e.message}) - proceeding (fail-open)."
+            }
+          } else {
+            echo "No PR number available - skipping merged-state guard."
+          }
+          if (merged) {
+            error("PR #${env.EFFECTIVE_PR_NUMBER} (${env.EFFECTIVE_PR_BRANCH}) is already merged to master - stopping the staging pipeline to avoid redundant runs and trigger loops.")
+          }
+        }
+      }
+    }
+
+    stage('Checkout') {
+      steps {
+        script {
+          try {
+            echo "Checking out branch: ${env.EFFECTIVE_PR_BRANCH}"
+            checkout([
+                $class: 'GitSCM',
+                branches: [[name: "${env.EFFECTIVE_PR_BRANCH}"]],
+                doGenerateSubmoduleConfigurations: false,
+                extensions: [
+                    [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'deploy/'], [path: 'Migration/']]]
+                ],
+                userRemoteConfigs: [[
+                    credentialsId: 'github-app-credentials',
+                    url: 'https://github.com/example/appdb-analytics-db.git'
+                ]]
+            ])
+            echo "✅ Checkout successful"
+            echo "Build causes: ${currentBuild.buildCauses}"
+          } catch(error) {
+            echo "First checkout failed, retrying..."
+            retry(1) {
+              checkout([
+                  $class: 'GitSCM',
+                  branches: [[name: "${env.EFFECTIVE_PR_BRANCH}"]],
+                  doGenerateSubmoduleConfigurations: false,
+                  extensions: [
+                      [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'deploy/'], [path: 'Migration/']]]
+                  ],
+                  userRemoteConfigs: [[
+                      credentialsId: 'github-app-credentials',
+                      url: 'https://github.com/example/appdb-analytics-db.git'
+                  ]]
+              ])
+            }
+          }
+        }
+      }
+    }
+    
+    stage('Debug Build Context') {
+      steps {
+        script {
+          echo "═══════════════════════════════════════"
+          echo "Build #${env.BUILD_NUMBER} Context:"
+          echo "═══════════════════════════════════════"
+          echo "EFFECTIVE_PR_NUMBER = ${env.EFFECTIVE_PR_NUMBER}"
+          echo "EFFECTIVE_PR_BRANCH = ${env.EFFECTIVE_PR_BRANCH}"
+          echo "EFFECTIVE_GIT_COMMIT = ${env.EFFECTIVE_GIT_COMMIT}"
+          echo "BUILD_CAUSE = ${currentBuild.buildCauses}"
+          echo "═══════════════════════════════════════"
+        }
+      }
+    }
+    
+    stage('🔄 Merge Latest Master') {
+      steps {
+        script {
+          echo "=== Syncing ${env.EFFECTIVE_PR_BRANCH} with latest master ==="
+          
+          try {
+            withCredentials([usernamePassword(
+              credentialsId: 'github-app-credentials',
+              usernameVariable: 'GITHUB_APP',
+              passwordVariable: 'GITHUB_ACCESS_TOKEN'
+            )]) {
+              
+              // Fetch latest master
+              powershell """
+                Write-Host "Fetching latest master branch..." -ForegroundColor Cyan
+                git config credential.helper store
+                git fetch https://ci-bot:\$env:GITHUB_ACCESS_TOKEN@github.com/example/appdb-analytics-db master
+                
+                Write-Host "Current branch: ${env.EFFECTIVE_PR_BRANCH}" -ForegroundColor Gray
+              """
+              
+              // Check for uncommitted changes and stash if needed
+              def hasChanges = powershell(
+                script: 'git status --porcelain',
+                returnStdout: true
+              ).trim()
+              
+              if (hasChanges) {
+                echo "⚠️ Uncommitted changes detected, stashing..."
+                powershell """
+                  git stash save "Jenkins auto-stash before master merge - \$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                """
+              }
+              
+              // Merge master into current branch
+              powershell """
+                Write-Host "Merging FETCH_HEAD into ${env.EFFECTIVE_PR_BRANCH}..." -ForegroundColor Cyan
+                git merge FETCH_HEAD --no-edit
+                
+                if (\$LASTEXITCODE -eq 0) {
+                  Write-Host "✅ Merge successful" -ForegroundColor Green
+                } else {
+                  Write-Host "❌ Merge failed" -ForegroundColor Red
+                  exit 1
+                }
+              """
+              
+              // Restore stashed changes if any
+              if (hasChanges) {
+                echo "Restoring stashed changes..."
+                powershell """
+                  \$stashList = git stash list
+                  if (\$stashList -match "Jenkins auto-stash before master merge") {
+                    git stash pop
+                    Write-Host "✅ Stashed changes restored" -ForegroundColor Green
+                  }
+                """
+              }
+              
+            }
+            
+            echo "✅ Branch is now synced with master"
+            
+          } catch (Exception e) {
+            def conflictCheck = powershell(
+              script: 'git status',
+              returnStdout: true
+            ).trim()
+            
+            if (conflictCheck.contains("both modified") || conflictCheck.contains("Unmerged paths")) {
+              echo "❌ MERGE CONFLICT DETECTED"
+              echo "Conflicting files:"
+              powershell "git diff --name-only --diff-filter=U"
+              powershell "git merge --abort"
+              
+              error("Cannot proceed: Merge conflicts detected. Please merge master into your branch manually and resolve conflicts.")
+            } else {
+              echo "❌ Unexpected merge error: ${e.message}"
+              error("Merge failed: ${e.message}")
+            }
+          }
+        }
+      }
+    }
+    
+    stage("📋 Migration Management") {
+      steps {
+        script {
+          echo "Running migration management for approved PR #${env.EFFECTIVE_PR_NUMBER}..."
+          setBuildStatus("pending", "Running migrations")
+          
+          dir("${env.WORKSPACE}/deploy") {
+            withCredentials([[$class: 'UsernamePasswordMultiBinding',
+              credentialsId: 'AppDb_DB_AppDb_Connect',
+              usernameVariable: 'USER',
+              passwordVariable: 'PASS']]) {
+              powershell """
+                powershell.exe -NoLogo -WindowStyle Hidden -ExecutionPolicy Bypass -File 'CICD_AppDb_Analytics_Generic_Migration_Script.ps1' -username "\$Env:USER" -password "\$Env:PASS"
+              """
+            }
+          }
+        }
+      }
+    }
+    
+    stage("✅ Validate Migration Order") {
+      steps {
+        script {
+          echo "Validating migration version order against staging database..."
+          
+          dir("${env.WORKSPACE}/deploy") {
+            withCredentials([[$class: 'UsernamePasswordMultiBinding',
+              credentialsId: 'AppDb_DB_AppDb_Connect',
+              usernameVariable: 'USER',
+              passwordVariable: 'PASS']]) {
+              powershell """
+                powershell.exe -NoLogo -WindowStyle Hidden -ExecutionPolicy Bypass -File 'Flyway_Validate_Migration_Order.ps1'
+              """
+            }
+          }
+        }
+      }
+    }
+ 
+    stage('📤 Push SQL Files') {
+      steps {
+        script {
+          dir("${WORKSPACE}") {
+            def hasChanges = powershell(
+              script: 'git status --porcelain',
+              returnStdout: true
+            ).trim()
+            
+            if (!hasChanges) {
+              echo "No changes to commit - skipping push"
+              return
+            }
+            
+            echo "Migration file changes detected. Proceeding with commit and push."
+            
+            withCredentials([usernamePassword(
+              credentialsId: 'github-app-credentials',
+              usernameVariable: 'GITHUB_APP',
+              passwordVariable: 'GITHUB_ACCESS_TOKEN'
+            )]) {
+              powershell """
+                git config user.email "opensource@example.com"
+                git config user.name "example Jenkins Bot"
+  
+                git add --ignore-removal Migration/
+                git add Migration/*.sql 2>`\$null
+  
+                \$hasStaged = git diff --cached --name-only
+                if (-not \$hasStaged) {
+                  Write-Host "No changes staged for commit - skipping" -ForegroundColor Yellow
+                  exit 0
+                }
+  
+                Write-Host "`nFiles staged for commit:" -ForegroundColor Green
+                git diff --cached --name-only
+  
+                git commit -m "chore: auto-commit migration updates [ci skip]" --no-verify
+                git push https://ci-bot:\$env:GITHUB_ACCESS_TOKEN@github.com/example/appdb-analytics-db HEAD:refs/heads/${env.EFFECTIVE_PR_BRANCH}
+              """
+            }
+          }
+        }
+      }
+    }
+    
+    stage('📦 Archive Artifacts') {
+      steps {
+        script {
+          echo "Archiving migration scripts generated for PR #${env.EFFECTIVE_PR_NUMBER} (${env.EFFECTIVE_PR_BRANCH})..."
+          
+          // Get list of files changed/added in this PR's branch compared to master
+          withCredentials([usernamePassword(
+            credentialsId: 'github-app-credentials',
+            usernameVariable: 'GITHUB_APP',
+            passwordVariable: 'GITHUB_ACCESS_TOKEN'
+          )]) {
+            // Ensure we have the latest master reference
+            powershell """
+              Write-Host "Fetching master branch reference..." -ForegroundColor Cyan
+              git fetch https://ci-bot:\$env:GITHUB_ACCESS_TOKEN@github.com/example/appdb-analytics-db master:refs/remotes/origin/master 2>`\$null
+            """
+          }
+          
+          def changedFiles = powershell(
+            script: """
+              # Get files that differ from master branch in Migration folder
+              \$files = git diff --name-only origin/master HEAD -- Migration/*.sql
+              if (\$files) {
+                Write-Output \$files
+              } else {
+                Write-Output ""
+              }
+            """,
+            returnStdout: true
+          ).trim()
+          
+          if (!changedFiles) {
+            echo "⚠️ No migration files were changed in this PR - skipping artifact archival"
+            return
+          }
+          
+          echo "Migration files to archive:"
+          changedFiles.split('\n').each { file ->
+            echo "  - ${file}"
+          }
+          
+          // Create a temporary directory for PR-specific artifacts
+          def artifactDir = "${WORKSPACE}/artifacts_PR${env.EFFECTIVE_PR_NUMBER}"
+          powershell """
+            if (Test-Path "${artifactDir}") {
+              Remove-Item -Path "${artifactDir}" -Recurse -Force
+            }
+            New-Item -ItemType Directory -Path "${artifactDir}" -Force | Out-Null
+          """
+          
+          // Copy only the changed migration files to artifact directory
+          changedFiles.split('\n').each { file ->
+            if (file.trim()) {
+              powershell """
+                \$sourceFile = Join-Path "${WORKSPACE}" "${file.trim()}"
+                \$destFile = Join-Path "${artifactDir}" (Split-Path "${file.trim()}" -Leaf)
+                
+                if (Test-Path \$sourceFile) {
+                  Copy-Item -Path \$sourceFile -Destination \$destFile -Force
+                  Write-Host "Copied: ${file.trim()}" -ForegroundColor Green
+                } else {
+                  Write-Host "Warning: File not found: \$sourceFile" -ForegroundColor Yellow
+                }
+              """
+            }
+          }
+          
+          // Archive the PR-specific artifacts
+          dir(artifactDir) {
+            archiveArtifacts artifacts: '*.sql', 
+                           fingerprint: true,
+                           allowEmptyArchive: true
+          }
+          
+          echo "✅ Archived ${changedFiles.split('\n').size()} migration file(s) for PR #${env.EFFECTIVE_PR_NUMBER}"
+        }
+      }
+    }
+    
+    stage('🚀 Trigger Staging Deployment Pipeline') {
+      steps {
+        script {
+          setBuildStatus("success", "All stages completed successfully")
+          echo "✅ Migration completed - Triggering deployment pipeline"
+          
+          if (env.EFFECTIVE_PR_NUMBER) {
+            try {
+              echo "========================================="
+              echo "Triggering Deployment Pipeline"
+              echo "========================================="
+              echo "PR Number: ${env.EFFECTIVE_PR_NUMBER}"
+              echo "Branch: ${env.EFFECTIVE_PR_BRANCH}"
+              echo "Commit: ${env.EFFECTIVE_GIT_COMMIT}"
+              
+              build job: 'DB/AppDb_Analytics/AppDb_Analytics_STAGING_DEPLOYMENT',
+                    wait: false,
+                    parameters: [
+                      string(name: 'PR_NUMBER', value: env.EFFECTIVE_PR_NUMBER),
+                      string(name: 'PR_BRANCH', value: env.EFFECTIVE_PR_BRANCH),
+                      string(name: 'GIT_COMMIT_HASH', value: env.EFFECTIVE_GIT_COMMIT)
+                    ]
+              
+              echo "✅ Deployment pipeline triggered successfully"
+            } catch (Exception e) {
+              echo "⚠️ Warning: Could not trigger deployment pipeline: ${e.message}"
+              // Don't fail the build if deployment trigger fails
+            }
+          } else {
+            echo "⚠️ No PR context available - skipping deployment trigger"
+          }
+        }
+      }
+    }
+  }
+    
+  post {
+  success {
+    script {
+      if (skipBuild) {
+        echo "Deployment skipped (no migration files or deploy skip tag)"
+      } else {
+        setBuildStatus("success", "Migration scripts deployed to Staging")
+        
+        // Get BUILD_USER safely with fallback
+        def buildUser = "Unknown User"
+        wrap([$class: 'BuildUser']) {
+          try {
+            buildUser = env.BUILD_USER ?: "Jenkins Bot"
+          } catch (Exception e) {
+            echo "⚠️ Could not determine build user: ${e.message}"
+          }
+        }
+        
+        slackSend channel: "#${SLACK_CHANNEL}",
+              color: 'good',
+              tokenCredentialId: "slack_token_eng_db_ci",
+              message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING Migration Management* stages completed successfully | *ID*:`${env.EFFECTIVE_PR_NUMBER}` by `${env.BUILD_USER}` ✅\n@here"
+
+              cleanTempDir()
+      }
+    }
+  }
+  
+  failure {
+    script {
+      if (skipBuild) {
+        currentBuild.result = 'SUCCESS'
+        echo "Build marked as success (was skipped)"
+      } else {
+        setBuildStatus("failure", "Migration failed")
+        
+        slackSend channel: "#${SLACK_CHANNEL}",
+              color: 'danger',
+              tokenCredentialId: "slack_token_eng_db_ci",
+              message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING Migration Management* failed\n Context:\n *ID*:`${env.EFFECTIVE_PR_NUMBER}` | *Branch*:`${env.EFFECTIVE_PR_BRANCH}`\n - check logs for details ❌\n@here attention required"
+      }
+      cleanTempDir()
+    }
+  }
+  
+  aborted {
+    script {
+      if (skipBuild) {
+        currentBuild.result = 'SUCCESS'
+        echo "Build marked as success (was skipped)"
+      } else {
+        setBuildStatus("error", "Deployment was aborted")
+        
+        slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'danger',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING Migration Management* was aborted | *ID*:`${env.EFFECTIVE_PR_NUMBER}` ❌\n@here attention required"
+      }
+      cleanTempDir()
+    }
+  }
+
+  }
+}
+
+def cleanTempDir() {
+  try {
+    cleanWs()
+    dir("${WORKSPACE}@tmp") { deleteDir() }
+    dir("${WORKSPACE}@script") { deleteDir() }
+    dir("${WORKSPACE}@script@tmp") { deleteDir() }
+  } catch (Exception e) {
+    echo "⚠️ Warning: Could not clean workspace: ${e.message}"
+  }
+}
+
+def setBuildStatus(String state, String description = null) {
+  // Use EFFECTIVE_GIT_COMMIT with fallback
+  def commitHash = env.EFFECTIVE_GIT_COMMIT ?: env.GIT_COMMIT
+  
+  if (!commitHash) {
+    echo "⚠️ GIT_COMMIT not available, skipping status update"
+    return
+  }
+  
+  String url = "https://api.github.com/repos/example/${env.REPO_NAME}/statuses/${commitHash}"
+  String context = "Jenkins Migration Management Pipeline"
+  
+  if (!description) {
+    description = getDescription(state)
+  }
+  
+  def payload = """
+    {
+      "target_url": "${env.BUILD_URL}", 
+      "state": "${state}",
+      "description": "${description}",
+      "context": "${context}"
+    }
+  """
+  
+  try {
+    withCredentials([usernamePassword(
+      credentialsId: 'ci-bot', 
+      usernameVariable: 'APP_ID', 
+      passwordVariable: 'KEY'
+    )]) {
+      def response = httpRequest(
+        contentType: 'APPLICATION_JSON',
+        customHeaders: [
+          [name: 'Accept', value: 'application/vnd.github.v3+json'], 
+          [name: 'Authorization', value: "Bearer ${KEY}"]
+        ],
+        httpMode: 'POST',
+        requestBody: payload,
+        url: url,
+        validResponseCodes: '200:201'
+      )
+      echo "✅ GitHub status updated: ${state}"
+    }
+  } catch (Exception e) {
+    echo "⚠️ Failed to update GitHub status: ${e.message}"
+  }
+}
+
+def getDescription(String state) {
+  switch(state) {
+    case "pending":
+      return "Migration in progress"
+    case "success":
+      return "Migration succeeded"
+    case "failure":
+      return "Migration failed"
+    case "error":
+      return "Migration encountered an error"
+    default:
+      return "Migration status: ${state}"
+  }
+}

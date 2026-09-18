@@ -1,0 +1,315 @@
+def approvalStatus = false
+def skipBuild = false
+def isPRBuild = false
+pipeline {
+  environment {
+    REPO_NAME = 'appdb-analytics-db'
+    REPO_URI  = 'https://github.com/example/appdb-analytics-db'
+    GITHUB_TOKEN_CREDENTIALS_ID = "ci-bot"
+    DEPLOYMENT_APPROVERS = 'approver1,approver2,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com'
+    DB_NAME = "AppDb_Analytics"
+    REPO = "example/appdb-analytics-db"
+    SLACK_CHANNEL = "eng_db_ci"
+    SERVICE_NAME = "AppDb_ANALYTICS"
+  }
+  
+  agent {
+    node {
+        label "dev-win-slave1"
+        customWorkspace "workspace/AppDb_Analytics_STAGING_${(env.CHANGE_BRANCH ?: '').replaceAll('/', '.')}"
+    }
+  }
+  
+  options {
+    skipStagesAfterUnstable()
+    buildDiscarder(logRotator(daysToKeepStr: '7'))
+    disableConcurrentBuilds()
+    copyArtifactPermission('*')
+  }
+  
+  stages {
+    stage('⏱️ Initial Delay') {
+      steps {
+        script {
+          echo "Waiting 10 seconds before starting CI pipeline..."
+          sleep(time: 10, unit: 'SECONDS')
+          echo "Delay complete - proceeding with CI validation"
+        }
+      }
+    }
+    
+    stage('Checkout') {
+      steps {
+        script {
+          try {
+            checkout scm
+            echo "Build causes: ${currentBuild.buildCauses}"
+            
+            // Verify checkout and list files
+            echo "Current directory: ${pwd()}"
+            powershell """
+              Write-Host "Listing files in workspace:"
+              Get-ChildItem -Force | Format-Table Name, LastWriteTime
+              
+              Write-Host "`nSearching for .sln files:"
+              Get-ChildItem -Filter *.sln -Recurse -ErrorAction SilentlyContinue | Select-Object FullName
+            """
+          } catch(error) {
+            echo "First build failed, retrying..."
+            retry(1) {
+              checkout scm
+            }
+          }
+        }
+      }
+    }
+    
+    stage('🔍 Check Commit Message') {
+      steps {
+        script {
+          def commitMessage = powershell(
+            script: 'git log -1 --pretty=%B',
+            returnStdout: true
+          ).trim()
+          
+          echo "Commit message: \"${commitMessage}\""
+          
+          if (commitMessage =~ /(?i)\[(ci skip|skip ci)\]/) {
+            echo "🚫 Found [ci skip] in commit message – skipping build."
+            skipBuild = true
+            currentBuild.result = 'SUCCESS'
+            currentBuild.description = "Build skipped"
+          }
+        }
+      }
+    }
+    
+    stage('Debug Build Context') {
+      when {
+        expression { return !skipBuild }
+      }
+      steps {
+        script {
+          echo "═══════════════════════════════════════"
+          echo "Build #${env.BUILD_NUMBER} Context:"
+          echo "═══════════════════════════════════════"
+          echo "CHANGE_ID = ${env.CHANGE_ID}"
+          echo "CHANGE_BRANCH = ${env.CHANGE_BRANCH}"
+          echo "CHANGE_TARGET = ${env.CHANGE_TARGET}"
+          echo "CHANGE_TITLE = ${env.CHANGE_TITLE}"
+          echo "CHANGE_AUTHOR = ${env.CHANGE_AUTHOR}"
+          echo "GIT_COMMIT = ${env.GIT_COMMIT}"
+          echo "BUILD_CAUSE = ${currentBuild.buildCauses}"
+          echo "═══════════════════════════════════════"
+
+       env.RELEASE_NOTES=env.GIT_COMMIT?.take(5)
+       slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'info',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME}> *STAGING* build detected Build #${env.BUILD_NUMBER} \nContext:\n*ID* = ${env.CHANGE_ID}\n*Branch* = <${env.REPO_URI}/compare/${env.CHANGE_BRANCH}|${env.CHANGE_BRANCH}>\n*Target* = <${env.REPO_URI}/tree/${env.CHANGE_TARGET}|${env.CHANGE_TARGET}>\n*Title*  = *${env.CHANGE_TITLE}*\n*Author* = <${env.REPO_URI}/commits?author=${env.CHANGE_AUTHOR}|${env.CHANGE_AUTHOR}>\n*Git*   = <${REPO_URI}/commit/${env.GIT_COMMIT}|${env.RELEASE_NOTES}>\n@here attention required⚠️ "
+
+        }
+      }
+    }
+    
+    stage('🧪 Validate Project Coverage') {
+      when {
+        expression { return !skipBuild }
+      }
+      steps {
+        // Advisory: warn about .sql files orphaned from the .sqlproj (the
+        // meta.MetaPMPTrafficDelta failure mode) before the SSDT build hits a
+        // cryptic SQL71501 cascade. Never fails the build (always exits 0) --
+        // the msbuild stage below remains the authoritative gate.
+        powershell '''
+          try {
+            $proj = Get-ChildItem -Path $env:WORKSPACE -Filter *.sqlproj -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($proj) {
+              & "$env:WORKSPACE/deploy/Validate-SqlprojCoverage.ps1" -ProjectDir $proj.Directory.FullName
+            } else {
+              Write-Host "No .sqlproj found - skipping coverage check"
+            }
+          } catch {
+            Write-Host "::warning::coverage check could not run: $_"
+          }
+          exit 0
+        '''
+      }
+    }
+
+    stage("🔨 Build") {
+      when {
+        allOf {
+          expression { return !skipBuild }
+        }
+      }
+      steps {
+        script {
+
+          isPRBuild = true
+          setBuildStatus("pending", "Building project")
+          
+          // Find the solution file
+          def solutionFile = powershell(
+            script: '''
+              $sln = Get-ChildItem -Filter *.sln -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($sln) {
+                Write-Output $sln.FullName
+              } else {
+                Write-Error "No .sln file found"
+                exit 1
+              }
+            ''',
+            returnStdout: true
+          ).trim()
+          
+          echo "Found solution file: ${solutionFile}"
+          
+          // Build using the full path
+          powershell """
+            msbuild "${solutionFile}" /p:Configuration=Release /p:Version=1.0.${env.BUILD_NUMBER}
+          """
+        }
+      }
+    }
+    
+    stage("⚠️ Quality Gates") {
+      when {
+        allOf {
+          expression { return !skipBuild }
+        }
+      }
+      steps {
+        discoverGitReferenceBuild referenceJob: 'DB/DB_Build/master'
+        recordIssues enabledForFailure: true,
+          tools: [msBuild()]
+      }
+    }
+  }
+    
+ post {
+    success {
+      script {
+        if (skipBuild) {
+          currentBuild.result = 'SUCCESS'
+          echo "✅ Build marked as success (was skipped)"
+        } else {
+          setBuildStatus("success", "Build succeeded")
+          slackSend channel: "#${SLACK_CHANNEL}",
+                        color: 'good',
+                        tokenCredentialId: "slack_token_eng_db_ci",
+                        message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING* Build succeeded \n *ID*:`${env.CHANGE_ID}` | *Branch*:`${env.CHANGE_BRANCH}`  ✅\n@here"
+            
+        }
+        cleanTempDir()
+      }
+  }
+
+  failure {
+    script {
+      if (skipBuild) {
+        currentBuild.result = 'SUCCESS'
+        echo "✅ Build marked as success (was skipped)"
+      }
+      else if (isPRBuild) {
+        setBuildStatus("failure", "Build failed")
+        slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'danger',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING* Build failed \n *ID*:`${env.CHANGE_ID}` | *Branch*:`${env.CHANGE_BRANCH}` - check logs for details ❌\n@here attention required"
+      } else {
+        // ensure the first initiation build failure not sent to github
+        // the failure message will only printing via the console
+
+        echo "❌ Build failed"
+
+      }
+      cleanTempDir()
+    }
+  }
+
+  aborted {
+    script {
+      if (skipBuild) {
+        currentBuild.result = 'SUCCESS'
+        echo "✅ Build marked as success (was skipped)"
+      } else {
+        setBuildStatus("error", "Build was aborted")
+        slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'danger',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING* Build was aborted *ID*:`${env.CHANGE_ID}` | *Branch*:`${env.CHANGE_BRANCH}` - aborted ❌\n@here attention required"
+      }
+      cleanTempDir()
+    }
+   }
+ }
+}
+
+def cleanTempDir() {
+  cleanWs()
+  dir("${WORKSPACE}@tmp") { deleteDir() }
+  dir("${WORKSPACE}@script") { deleteDir() }
+  dir("${WORKSPACE}@script@tmp") { deleteDir() }
+}
+
+def setBuildStatus(String state, String description = null) {
+  if (!env.GIT_COMMIT) {
+    return
+  }
+  
+  String url = "https://api.github.com/repos/example/${env.REPO_NAME}/statuses/${env.GIT_COMMIT}"
+  String context = "Jenkins CI-Build Pipeline"
+  
+  if (!description) {
+    description = getDescription(state)
+  }
+  
+  def payload = """
+    {
+      "target_url": "${env.BUILD_URL}", 
+      "state": "${state}",
+      "description": "${description}",
+      "context": "${context}"
+    }
+  """
+  
+  try {
+    withCredentials([usernamePassword(
+      credentialsId: 'ci-bot', 
+      usernameVariable: 'APP_ID', 
+      passwordVariable: 'KEY'
+    )]) {
+      def response = httpRequest(
+        contentType: 'APPLICATION_JSON',
+        customHeaders: [
+          [name: 'Accept', value: 'application/vnd.github.v3+json'], 
+          [name: 'Authorization', value: "Bearer ${KEY}"]
+        ],
+        httpMode: 'POST',
+        requestBody: payload,
+        url: url,
+        validResponseCodes: '200:201'
+      )
+      echo "✅ GitHub status updated: ${state}"
+    }
+  } catch (Exception e) {
+    echo "⚠️ Failed to update GitHub status: ${e.message}"
+  }
+}
+
+def getDescription(String state) {
+  switch(state) {
+    case "pending":
+      return "Build in progress"
+    case "success":
+      return "Build succeeded"
+    case "failure":
+      return "Build failed"
+    case "error":
+      return "Build encountered an error"
+    default:
+      return "Build status: ${state}"
+  }
+}
+

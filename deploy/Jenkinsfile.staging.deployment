@@ -1,0 +1,512 @@
+def approvedBy = null
+def skipBuild = false
+
+pipeline {
+  parameters {
+    string(name: 'PR_NUMBER', defaultValue: '', description: 'Pull Request Number')
+    string(name: 'PR_BRANCH', defaultValue: '', description: 'Pull Request Branch Name')
+    string(name: 'GIT_COMMIT_HASH', defaultValue: '', description: 'Git Commit Hash')
+    string(name: 'RP_TICKET', defaultValue: '', description: 'RP (Release Plan) ticket')
+    booleanParam(name: 'FAST_TRACK', defaultValue: true, description: 'Deploy with FastTrack')
+    booleanParam(name: 'POLICYGATE_DEBUG', defaultValue: false, description: 'Enable PolicyGate debug behaviour')
+  }
+  
+  environment {
+    SLACK_CHANNEL = "eng_db_ci" //channelId of eng_db_ci       
+    SERVICE_NAME = "AppDb_ANALYTICS"
+    REPO_NAME = 'appdb-analytics-db'
+    GITHUB_TOKEN_CREDENTIALS_ID = "ci-bot"
+    // ---- PolicyGate release governance ----
+    POLICYGATE_API_KEY = credentials('POLICYGATE_API_KEY')
+    POLICYGATE_DOMAIN  = "policygate.example.com"
+    POLICYGATE_ENV     = "staging"
+    DEPLOYMENT_APPROVERS = 'approver1,approver2,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com,opensource@example.com'
+    DB_NAME = "AppDb_Analytics"
+    REPO = "example/appdb-analytics-db"
+    DEPLOY_SCRIPTS_DIR = "${WORKSPACE}/deploy-scripts-checkout"
+    ARTIFACTS_DIR = "${WORKSPACE}/migration-artifacts"
+    
+    // Use parameters if available, otherwise fall back to env vars
+    EFFECTIVE_PR_NUMBER = "${params.PR_NUMBER ?: env.CHANGE_ID ?: ''}"
+    EFFECTIVE_PR_BRANCH = "${params.PR_BRANCH ?: env.CHANGE_BRANCH ?: ''}"
+    EFFECTIVE_GIT_COMMIT = "${params.GIT_COMMIT_HASH ?: env.GIT_COMMIT ?: ''}"
+  }
+  
+  agent {
+    node {
+      label "dev-win-slave1"
+      customWorkspace "workspace/AppDb_Analytics_STG_DPLY"
+    }
+  }
+  
+  options {
+    skipStagesAfterUnstable()
+    buildDiscarder(logRotator(daysToKeepStr: '7'))
+    disableConcurrentBuilds()
+    retry(1)
+  }
+  
+  stages {
+    stage('🛑 Stop If PR Already Merged') {
+      steps {
+        script {
+          // Never deploy an already-merged PR to staging; fail fast so a merged
+          // branch cannot be (re)deployed. Fail-open only on API errors.
+          def merged = false
+          if (env.EFFECTIVE_PR_NUMBER) {
+            try {
+              withCredentials([usernamePassword(credentialsId: env.GITHUB_TOKEN_CREDENTIALS_ID, usernameVariable: 'APP_ID', passwordVariable: 'KEY')]) {
+                def resp = httpRequest(
+                  httpMode: 'GET',
+                  url: "https://api.github.com/repos/example/${env.REPO_NAME}/pulls/${env.EFFECTIVE_PR_NUMBER}",
+                  customHeaders: [
+                    [name: 'Accept', value: 'application/vnd.github.v3+json'],
+                    [name: 'Authorization', value: "Bearer ${KEY}", maskValue: true]
+                  ],
+                  validResponseCodes: '200:404'
+                )
+                if (resp.status == 200) {
+                  def pr = readJSON(text: resp.content)
+                  merged = (pr.merged == true)
+                  echo "PR #${env.EFFECTIVE_PR_NUMBER}: state=${pr.state}, merged=${pr.merged}"
+                } else {
+                  echo "⚠️ PR #${env.EFFECTIVE_PR_NUMBER} lookup returned HTTP ${resp.status} - proceeding (fail-open)."
+                }
+              }
+            } catch (Exception e) {
+              echo "⚠️ Could not verify PR merge state (${e.message}) - proceeding (fail-open)."
+            }
+          } else {
+            echo "No PR number available - skipping merged-state guard."
+          }
+          if (merged) {
+            error("PR #${env.EFFECTIVE_PR_NUMBER} (${env.EFFECTIVE_PR_BRANCH}) is already merged to master - skipping staging deployment.")
+          }
+        }
+      }
+    }
+
+    stage('Clean Workspace') {
+      steps {
+        script {
+          echo "========================================="
+          echo "Cleaning Workspace"
+          echo "========================================="
+          cleanWs()
+          echo "Workspace cleaned successfully"
+          echo "Ready for fresh artifact copy"
+        }
+      }
+    }
+
+stage('Fetch Artifacts from CI Build') {
+  steps {
+    script {
+      echo "========================================="
+      echo "Fetching Validated Artifacts"
+      echo "========================================="
+      
+      if (!env.EFFECTIVE_PR_NUMBER) {
+        error("PR_NUMBER not provided. This pipeline must be triggered with PR information.")
+      }
+      
+      // AppDb_Analytics_STAGING_MANAGEMENT is a regular parameterized job, not multibranch
+      def sourceJob = "DB/AppDb_Analytics/AppDb_Analytics_STAGING_MANAGEMENT"
+      echo "Source Job: ${sourceJob}"
+      echo "PR Number: ${env.EFFECTIVE_PR_NUMBER}"
+      echo "PR Branch: ${env.EFFECTIVE_PR_BRANCH}"
+      
+      // Create artifacts directory
+      powershell "New-Item -ItemType Directory -Force -Path '${env.ARTIFACTS_DIR}'"
+      
+      try {
+        echo "Attempting to copy artifacts from upstream build..."
+        
+        // Use upstream selector since this job is triggered by the migration job
+        copyArtifacts(
+          projectName: sourceJob,
+          target: "${env.ARTIFACTS_DIR}",
+          selector: upstream(fallbackToLastSuccessful: true),
+          fingerprintArtifacts: true,
+          flatten: true,
+          filter: "**/*.sql",
+          optional: false
+        )
+        
+        echo "✅ Artifacts copied successfully from: ${sourceJob}"
+        
+      } catch (Exception e) {
+        echo "========================================="
+        echo "❌ ARTIFACT COPY FAILED"
+        echo "========================================="
+        echo "Error: ${e.message}"
+        echo ""
+        echo "Build triggered by:"
+        currentBuild.getBuildCauses().each { cause ->
+          echo "  - ${cause}"
+        }
+        echo ""
+        echo "Troubleshooting checklist:"
+        echo "1. ✓ Source job exists: ${sourceJob}"
+        echo "2. ? Does ${sourceJob} have a successful build with archived artifacts?"
+        echo "3. ? Is 'copyArtifactPermission' configured in ${sourceJob}?"
+        echo "4. ? Does this job (AppDb_Analytics_STAGING_DEPLOYMENT) have permission?"
+        echo ""
+        echo "Required configuration in ${sourceJob}:"
+        echo "  options {"
+        echo "    copyArtifactPermission('DB/AppDb_Analytics/AppDb_Analytics_STAGING_DEPLOYMENT')"
+        echo "    // or use '*' to allow all jobs"
+        echo "  }"
+        echo "========================================="
+        
+        throw e
+      }
+      
+      // Verify artifacts were copied and are valid
+      def verification = powershell(
+        script: """
+          Write-Host "`n=== Verifying Copied Artifacts ===" -ForegroundColor Cyan
+          Write-Host "Target directory: ${env.ARTIFACTS_DIR}`n"
+          
+          # Look for SQL files in target directory and subdirectories
+          \$sqlFiles = Get-ChildItem -Path '${env.ARTIFACTS_DIR}' -Filter *.sql -Recurse -ErrorAction SilentlyContinue
+          
+          if (\$sqlFiles.Count -eq 0) {
+            Write-Host "❌ ERROR: No SQL files found in artifacts directory!" -ForegroundColor Red
+            Write-Host "`nDirectory contents:" -ForegroundColor Yellow
+            Get-ChildItem -Path '${env.ARTIFACTS_DIR}' -Recurse | ForEach-Object {
+              Write-Host "  \$(\$_.FullName)" -ForegroundColor Gray
+            }
+            exit 1
+          }
+          
+          Write-Host "✅ Successfully copied \$(\$sqlFiles.Count) SQL file(s):" -ForegroundColor Green
+          \$sqlFiles | ForEach-Object {
+            \$sizeKB = [math]::Round(\$_.Length / 1KB, 2)
+            Write-Host "  - \$(\$_.Name) (\${sizeKB} KB, Modified: \$(\$_.LastWriteTime))" -ForegroundColor Green
+          }
+          
+          Write-Host "`n✓ Artifacts ready for deployment to STAGING" -ForegroundColor Cyan
+          exit 0
+        """,
+        returnStatus: true
+      )
+      
+      if (verification != 0) {
+        error("Artifact verification failed - no SQL files found after copy")
+      }
+    }
+  }
+}
+    
+    stage('Get Deploy Scripts') {
+  steps {
+    script {
+      echo "Getting deployment scripts from repository..."
+      echo "Branch to checkout: ${env.EFFECTIVE_PR_BRANCH}"
+      
+      if (!env.EFFECTIVE_PR_BRANCH) {
+        error("PR_BRANCH not provided. Cannot checkout deploy scripts without branch information.")
+      }
+      
+      // Create deploy scripts directory
+      powershell "New-Item -ItemType Directory -Force -Path '${env.DEPLOY_SCRIPTS_DIR}'"
+      
+      dir("${env.DEPLOY_SCRIPTS_DIR}") {
+        checkout([
+          $class: 'GitSCM',
+          branches: [[name: "${env.EFFECTIVE_PR_BRANCH}"]],  // Changed from CHANGE_BRANCH
+          doGenerateSubmoduleConfigurations: false,
+          extensions: [
+            [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'deploy/']]]
+          ],
+          userRemoteConfigs: [[
+            credentialsId: 'github-app-credentials',
+            url: 'https://github.com/example/appdb-analytics-db.git'
+          ]]
+        ])
+      }
+      
+      // Verify deploy script
+      def deployScriptExists = powershell(
+        script: "Test-Path '${env.DEPLOY_SCRIPTS_DIR}\\deploy\\Execute_Staging_Migrations.ps1'",
+        returnStdout: true
+      ).trim()
+      
+      if (deployScriptExists == "True") {
+        echo "=== Deploy Script Status ==="
+        echo "✓ Execute_Staging_Migrations.ps1 ready"
+        echo "======================================="
+      } else {
+        error("Deploy script not found!")
+      }
+    }
+  }
+}
+    
+    stage('Debug Build Context') {
+      when {
+        expression { return !skipBuild }
+      }
+      steps {
+        script {
+          echo "======================================="
+          echo "Deployment Build #${env.BUILD_NUMBER} Context:"
+          echo "======================================="
+          echo "CHANGE_ID = ${env.CHANGE_ID}"
+          echo "CHANGE_BRANCH = ${env.CHANGE_BRANCH}"
+          echo "CHANGE_TARGET = ${env.CHANGE_TARGET}"
+          echo "CHANGE_TITLE = ${env.CHANGE_TITLE}"
+          echo "CHANGE_AUTHOR = ${env.CHANGE_AUTHOR}"
+          echo "GIT_COMMIT = ${env.GIT_COMMIT}"
+          echo "ARTIFACTS_DIR = ${env.ARTIFACTS_DIR}"
+          echo "DEPLOY_SCRIPTS_DIR = ${env.DEPLOY_SCRIPTS_DIR}"
+          echo "======================================="
+
+          env.RELEASE_ID = "${env.BUILD_ID}_${env.JOB_NAME}"
+          // Surface whether the PolicyGate credential resolved in this Jenkins folder
+          powershell label: 'PolicyGate credential check', script: 'Write-Host "POLICYGATE_API_KEY is set: $([bool]$env:POLICYGATE_API_KEY)"'
+        }
+      }
+    }
+ stage('Validate Migration Files Exist') {
+  when {
+    expression { return !skipBuild }
+  }
+  steps {
+    script {
+      echo "Validating migration files for branch: ${env.EFFECTIVE_PR_BRANCH}"
+      setBuildStatus("pending", "Validating migration files")
+      
+      // Look in artifacts directory where files were copied
+      dir("${env.ARTIFACTS_DIR}") {
+        def migrationFiles = powershell(
+          script: "Get-ChildItem -Filter *.sql | Measure-Object | Select-Object -ExpandProperty Count",
+          returnStdout: true
+        ).trim()
+        
+        if (migrationFiles == "0") {
+          echo "No migration files found for branch ${env.EFFECTIVE_PR_BRANCH}"
+          echo "This may be expected if there are no database changes."
+          currentBuild.description = "No migrations to deploy"
+          skipBuild = true
+          return
+        }
+        
+        echo "Found ${migrationFiles} migration file(s) ready for deployment"
+        
+        // List the files
+        powershell """
+          Write-Host "`nMigration files to be deployed:" -ForegroundColor Cyan
+          Get-ChildItem -Filter *.sql | ForEach-Object {
+            Write-Host "  - \$(\$_.Name)" -ForegroundColor Green
+          }
+        """
+      }
+    }
+  }
+}
+    
+stage('🛡️ PolicyGate Pre-Deploy') {
+  when {
+    expression { return !skipBuild }
+  }
+  steps {
+    script {
+      def result = runPolicyGateGate('pre-deploy', true)
+      checkPolicyGateSignal(result, 'Pre-Deploy')
+    }
+  }
+}
+stage('Deploy Migration Scripts to Staging') {
+  when {
+    expression { return !skipBuild }
+  }
+  steps {
+    script {
+      echo "Deploying migration scripts for PR #${env.EFFECTIVE_PR_NUMBER} (${env.EFFECTIVE_PR_BRANCH})..."
+      setBuildStatus("pending", "Deploying migration scripts")
+      
+      dir("${env.DEPLOY_SCRIPTS_DIR}/deploy") {
+        withCredentials([[$class: 'UsernamePasswordMultiBinding',
+          credentialsId: 'AppDb_DB_AppDb_Connect',
+          usernameVariable: 'USER',
+          passwordVariable: 'PASS']]) {
+          
+          try {
+            // Pass the artifacts directory to the PowerShell script
+            powershell """
+              powershell.exe -NoLogo -WindowStyle Hidden -ExecutionPolicy Bypass -File 'Execute_Staging_Migrations.ps1' -username "\$Env:USER" -password "\$Env:PASS" -branch "${env.EFFECTIVE_PR_BRANCH.replaceAll('/', '.')}" -artifactsPath "${env.ARTIFACTS_DIR}"
+            """
+            
+            echo "Migration scripts deployed successfully"
+            currentBuild.description = "PR #${env.EFFECTIVE_PR_NUMBER} - Deployed to Staging"
+            
+          } catch (Exception e) {
+            echo "Deployment failed: ${e.message}"
+            currentBuild.description = "PR #${env.EFFECTIVE_PR_NUMBER} - Deployment Failed"
+            throw e
+          }
+        }
+      }
+    }
+  }
+}
+}
+    
+post {
+  success {
+    script {
+      if (skipBuild) {
+        echo "Deployment skipped (no migration files or deploy skip tag)"
+      } else {
+        setBuildStatus("success", "Migration scripts deployed to Staging")
+
+        // Get BUILD_USER safely with fallback
+        def buildUser = "Unknown User"
+        wrap([$class: 'BuildUser']) {
+          try {
+            buildUser = env.BUILD_USER ?: "Jenkins Bot"
+          } catch (Exception e) {
+            echo "⚠️ Could not determine build user: ${e.message}"
+          }
+        }
+
+        slackSend channel: "#${SLACK_CHANNEL}",
+                  color: 'good',
+                  tokenCredentialId: "slack_token_eng_db_ci",
+                  message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING Deployment* stages completed successfully | *ID*:`${env.EFFECTIVE_PR_NUMBER}` by `${env.BUILD_USER}` ✅\n@here"
+
+        if (env.RELEASE_ID) { runPolicyGateGate('post-deploy', true) }
+        cleanTempDir()
+      }
+    }
+  }
+
+  failure {
+    script {
+      if (skipBuild) {
+        currentBuild.result = 'SUCCESS'
+        echo "Build marked as success (was skipped)"
+      } else {
+        setBuildStatus("failure", "Deployment failed")
+
+        slackSend channel: "#${SLACK_CHANNEL}",
+               color: 'danger',
+               tokenCredentialId: "slack_token_eng_db_ci",
+               message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING Deployment* failed\n Context:\n *ID*:`${env.EFFECTIVE_PR_NUMBER}` | *Branch*:`${env.EFFECTIVE_PR_BRANCH}`\n - check logs for details ❌\n@here attention required"
+
+      }
+      if (env.RELEASE_ID) { runPolicyGateGate('post-deploy', false) }
+      cleanTempDir()
+    }
+  }
+
+  aborted {
+    script {
+      if (skipBuild) {
+        currentBuild.result = 'SUCCESS'
+        echo "Build marked as success (was skipped)"
+      } else {
+        setBuildStatus("error", "Deployment was aborted")
+
+        slackSend channel: "#${SLACK_CHANNEL}",
+               color: 'danger',
+               tokenCredentialId: "slack_token_eng_db_ci",
+               message: "<${env.JOB_URL}|${SERVICE_NAME} > *STAGING Deployment* was aborted | *ID*:`${env.EFFECTIVE_PR_NUMBER}` ❌\n@here attention required"
+      }
+      cleanTempDir()
+    }
+  }
+}
+}
+
+def cleanTempDir() {
+  cleanWs()
+  dir("${WORKSPACE}@tmp") { deleteDir() }
+  dir("${WORKSPACE}@script") { deleteDir() }
+  dir("${WORKSPACE}@script@tmp") { deleteDir() }
+}
+
+def setBuildStatus(String state, String description = null) {
+  if (!env.GIT_COMMIT) {
+    echo "GIT_COMMIT not available, skipping status update"
+    return
+  }
+  
+  String url = "https://api.github.com/repos/example/${env.REPO_NAME}/statuses/${env.GIT_COMMIT}"
+  String context = "Jenkins Staging Deployment"
+  
+  if (!description) {
+    description = getDescription(state)
+  }
+  
+  def payload = """
+    {
+      "target_url": "${env.BUILD_URL}", 
+      "state": "${state}",
+      "description": "${description}",
+      "context": "${context}"
+    }
+  """
+  
+  try {
+    withCredentials([usernamePassword(
+      credentialsId: 'ci-bot', 
+      usernameVariable: 'APP_ID', 
+      passwordVariable: 'KEY'
+    )]) {
+      def response = httpRequest(
+        contentType: 'APPLICATION_JSON',
+        customHeaders: [
+          [name: 'Accept', value: 'application/vnd.github.v3+json'], 
+          [name: 'Authorization', value: "Bearer ${KEY}"]
+        ],
+        httpMode: 'POST',
+        requestBody: payload,
+        url: url,
+        validResponseCodes: '200:201'
+      )
+      echo "GitHub deployment status updated: ${state}"
+    }
+  } catch (Exception e) {
+    echo "Failed to update GitHub status: ${e.message}"
+  }
+}
+
+def getDescription(String state) {
+  switch(state) {
+    case "pending":
+      return "Deployment in progress"
+    case "success":
+      return "Deployment succeeded"
+    case "failure":
+      return "Deployment failed"
+    case "error":
+      return "Deployment encountered an error"
+    default:
+      return "Deployment status: ${state}"
+  }
+}
+
+// ---- PolicyGate (Windows/PowerShell-native gate client) ----
+def runPolicyGateGate(String phase, boolean success) {
+  def resultFile = "policygate_${phase}.json"
+  def ft         = params.FAST_TRACK ? 'true' : 'false'
+  def succ       = success ? 'true' : 'false'
+  def commit     = env.EFFECTIVE_GIT_COMMIT ?: ''
+  def version    = (commit && commit.length() >= 7) ? commit.substring(0, 7) : (env.BUILD_NUMBER ?: 'unknown')
+  def repoUrl    = "https://github.com/example/${env.REPO_NAME}"
+  def scriptPath = "${env.DEPLOY_SCRIPTS_DIR}/deploy/PolicyGate-Gate.ps1"
+  powershell label: "PolicyGate ${phase}",
+    script: "Set-ExecutionPolicy Bypass -Scope Process -Force; & '${scriptPath}' -Phase '${phase}' -Environment '${env.POLICYGATE_ENV}' -ReleaseId '${env.RELEASE_ID}' -ServiceName '${env.SERVICE_NAME}' -Version '${version}' -Ticket '${params.RP_TICKET ?: ''}' -FastTrack '${ft}' -Success '${succ}' -GitCommit '${commit}' -GitBranch '${env.EFFECTIVE_PR_BRANCH ?: ''}' -GitRepo '${repoUrl}' -BuildNumber '${env.BUILD_NUMBER ?: ''}' -BuildUrl '${env.BUILD_URL ?: ''}' -JobName '${env.JOB_NAME ?: ''}' -RequestedBy '${env.BUILD_USER_ID ?: 'jenkins'}' -PolicyGateDomain '${env.POLICYGATE_DOMAIN}' -ResultFile '${resultFile}'"
+  return readJSON(file: resultFile)
+}
+
+def checkPolicyGateSignal(result, String stage) {
+  def signal = result?.signal ?: 'UNKNOWN'
+  if (signal == 'DENY') {
+    error("PolicyGate ${stage} gate returned DENY — deployment blocked")
+  }
+  echo "PolicyGate ${stage} gate signal: ${signal}"
+}

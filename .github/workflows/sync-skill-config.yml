@@ -1,0 +1,577 @@
+name: Sync Skill Config with Repository State
+
+# Detects drift between the SQL filesystem and the skill config files
+# (repo-config.md + role_app_ci.sql) and lets Claude reconcile it
+# automatically.
+#
+# Master is branch-protected, so we cannot push directly. Instead we use
+# a single long-lived bot branch (`bot/sql-skill-config-sync`):
+#   - Each run force-pushes the latest reconciled state to that branch.
+#   - One PR is reused: updated if open, created if not.
+#   - The PR is enabled for auto-merge (squash + branch delete) so it
+#     merges itself the moment required status checks pass.
+#
+# Net effect: at most one transient PR ever exists, master stays in sync
+# without manual review for non-functional config drift, and there is no
+# version sprawl of `feature/skill-migration-generation-v*` branches.
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'AppDb_Analytics/**/*.sql'
+
+  workflow_dispatch:
+
+env:
+  DATABASE: 'AppDb_Analytics'
+  DB_DIR: 'AppDb_Analytics'
+  REPO_CONFIG_PATH: '.claude/skills/sql-gener8-migration/references/repo-config.md'
+  ROLE_FILE_PATH: 'AppDb_Analytics/Security/role_app_ci.sql'
+  SYNC_BRANCH: 'bot/sql-skill-config-sync'
+
+# A single concurrency group so back-to-back master pushes don't race
+# each other on the same bot branch.
+concurrency:
+  group: sync-skill-config
+  cancel-in-progress: false
+
+jobs:
+  sync-config:
+    name: Detect Config Drift and Sync
+    runs-on: windows-latest
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Collect filesystem state
+        id: collect
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host "COLLECTING FILESYSTEM STATE"
+          Write-Host "========================================="
+
+          $dbDir = $env:DB_DIR
+
+          $allDirs = Get-ChildItem -Path $dbDir -Directory -Recurse -ErrorAction SilentlyContinue |
+              Select-Object @{N='RelativePath';E={ $_.FullName.Replace("$PWD\", "").Replace("$PWD/", "") }}, Name
+          $dirListing = $allDirs | ConvertTo-Json -Compress
+          Write-Host "Found $($allDirs.Count) directories under $dbDir"
+
+          $synFiles = Get-ChildItem -Path $dbDir -Recurse -Filter "*.sql" -ErrorAction SilentlyContinue |
+              Where-Object { $_.Directory.Name -eq "Synonyms" } |
+              ForEach-Object {
+                  $relPath = $_.FullName.Replace("$PWD\", "").Replace("$PWD/", "")
+                  @{ Path = $relPath; Content = ([System.IO.File]::ReadAllText($_.FullName)) }
+              }
+          $synonymFiles = $synFiles | ConvertTo-Json -Compress
+          if ($null -eq $synonymFiles) { $synonymFiles = "[]" }
+          Write-Host "Found $($synFiles.Count) synonym files"
+
+          # Schema Object Inventory — per-schema list of object filenames so
+          # Claude can infer a real description (replaces the old
+          # "Auto-detected — update description" placeholder text).
+          $excludeDirs = @('Security','Storage','Scripts','external-refs','.vs','Migration','Archive','deploy','bin','obj','Properties')
+          $schemaDirs = Get-ChildItem -Path $dbDir -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $excludeDirs -notcontains $_.Name }
+
+          $schemaInventory = @{}
+          foreach ($sd in $schemaDirs) {
+              $schema = $sd.Name
+              $inv = @{ Tables = @(); Views = @(); StoredProcedures = @(); Functions = @(); Triggers = @(); UDTs = @(); Synonyms = @() }
+              foreach ($subdir in @('Tables','Views','Stored Procedures','Functions','Triggers','User Defined Types','Synonyms')) {
+                  $p = Join-Path $sd.FullName $subdir
+                  if (Test-Path $p) {
+                      $names = Get-ChildItem -Path $p -Filter "*.sql" -File -ErrorAction SilentlyContinue |
+                          ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Name) }
+                      switch ($subdir) {
+                          'Tables'              { $inv.Tables             = @($names) }
+                          'Views'               { $inv.Views              = @($names) }
+                          'Stored Procedures'   { $inv.StoredProcedures   = @($names) }
+                          'Functions'           { $inv.Functions          = @($names) }
+                          'Triggers'            { $inv.Triggers           = @($names) }
+                          'User Defined Types'  { $inv.UDTs               = @($names) }
+                          'Synonyms'            { $inv.Synonyms           = @($names) }
+                      }
+                  }
+              }
+              $schemaInventory[$schema] = $inv
+          }
+          $schemaInventoryJson = $schemaInventory | ConvertTo-Json -Compress -Depth 5
+          if ($null -eq $schemaInventoryJson) { $schemaInventoryJson = "{}" }
+          Write-Host "Schema inventory: $($schemaDirs.Count) schemas catalogued"
+
+          # Linked Servers Found — extract `[LinkedServerName].[$(Variable)]`
+          # tokens so Claude can flag undocumented linked servers.
+          $linkedServers = @{}
+          foreach ($s in $synFiles) {
+              $matches = [regex]::Matches($s.Content, '\[(\w+)\]\.\[\$\(\w+\)\]')
+              foreach ($m in $matches) {
+                  $linkedServers[$m.Groups[1].Value] = $true
+              }
+          }
+          $linkedServersList = @($linkedServers.Keys | Sort-Object)
+          $linkedServersJson = $linkedServersList | ConvertTo-Json -Compress
+          if ($null -eq $linkedServersJson) { $linkedServersJson = "[]" }
+          if ($linkedServersList.Count -eq 1) { $linkedServersJson = "[`"$($linkedServersList[0])`"]" }
+          Write-Host "Linked servers detected: $($linkedServersList.Count) ($($linkedServersList -join ', '))"
+
+          $repoConfigPath = $env:REPO_CONFIG_PATH
+          $roleFilePath = $env:ROLE_FILE_PATH
+
+          if (-not (Test-Path $repoConfigPath)) {
+              Write-Host "::error::repo-config.md not found at $repoConfigPath"
+              exit 1
+          }
+          if (-not (Test-Path $roleFilePath)) {
+              Write-Host "::error::role_app_ci.sql not found at $roleFilePath"
+              exit 1
+          }
+
+          $repoConfig = [System.IO.File]::ReadAllText((Resolve-Path $repoConfigPath).Path)
+          $roleFile = [System.IO.File]::ReadAllText((Resolve-Path $roleFilePath).Path)
+
+          Write-Host "repo-config.md: $($repoConfig.Length) chars"
+          Write-Host "role_app_ci.sql: $($roleFile.Length) chars"
+
+          @{
+              DirectoryListing = $dirListing
+              SynonymFiles = $synonymFiles
+              SchemaInventory = $schemaInventoryJson
+              LinkedServers = $linkedServersJson
+              RepoConfig = $repoConfig
+              RoleFile = $roleFile
+          } | ConvertTo-Json -Depth 5 | Out-File "collected_state.json" -Encoding UTF8
+
+          Write-Host "Filesystem state collected and saved"
+
+      - name: Call Claude API for drift detection
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          Write-Host "========================================="
+          Write-Host "CALLING CLAUDE API FOR DRIFT DETECTION"
+          Write-Host "========================================="
+
+          if ([string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)) {
+              Write-Host "::error::ANTHROPIC_API_KEY not configured in GitHub Secrets"
+              exit 1
+          }
+
+          $state = Get-Content "collected_state.json" -Raw | ConvertFrom-Json
+
+          $skillPath = ".claude/skills/sync-config"
+          $skillContent = [System.IO.File]::ReadAllText((Resolve-Path "$skillPath/SKILL.md").Path)
+
+          $frontmatterEnd = $skillContent.IndexOf("---", 3)
+          if ($frontmatterEnd -gt 0) {
+              $skillBody = $skillContent.Substring($frontmatterEnd + 3).TrimStart()
+          } else {
+              $skillBody = $skillContent
+          }
+
+          $prompt = $skillBody
+          $prompt = $prompt.Replace("{{DATABASE}}", $env:DATABASE)
+          $prompt = $prompt.Replace("{{DB_DIR}}", $env:DB_DIR)
+          $prompt = $prompt.Replace("{{DIRECTORY_LISTING}}", $state.DirectoryListing)
+          $prompt = $prompt.Replace("{{SYNONYM_FILES}}", $state.SynonymFiles)
+          $prompt = $prompt.Replace("{{SCHEMA_INVENTORY}}", $state.SchemaInventory)
+          $prompt = $prompt.Replace("{{LINKED_SERVERS}}", $state.LinkedServers)
+          $prompt = $prompt.Replace("{{CURRENT_REPO_CONFIG}}", $state.RepoConfig)
+          $prompt = $prompt.Replace("{{CURRENT_ROLE_FILE}}", $state.RoleFile)
+
+          Write-Host "Prompt built, length: $($prompt.Length) characters"
+
+          $apiBody = @{
+              model = "claude-opus-4-8"
+              max_tokens = 16000
+              messages = @(
+                  @{
+                      role = "user"
+                      content = $prompt
+                  }
+              )
+          } | ConvertTo-Json -Depth 10
+
+          $bodyFile = Join-Path $env:RUNNER_TEMP "sync_api_body.json"
+          [System.IO.File]::WriteAllText($bodyFile, $apiBody, (New-Object System.Text.UTF8Encoding $false))
+          $bodySizeKB = [math]::Round((Get-Item $bodyFile).Length / 1KB, 1)
+          Write-Host "Request body size: $bodySizeKB KB"
+
+          $responseFile = Join-Path $env:RUNNER_TEMP "sync_api_response.json"
+
+          $maxRetries = 3
+          $retryDelaySeconds = 10
+          $attempt = 0
+          $success = $false
+          $lastError = $null
+
+          while ($attempt -lt $maxRetries -and -not $success) {
+              $attempt++
+
+              if ($attempt -gt 1) {
+                  Write-Host "Retry attempt $attempt of $maxRetries after $retryDelaySeconds seconds..."
+                  Start-Sleep -Seconds $retryDelaySeconds
+                  $retryDelaySeconds *= 2
+              } else {
+                  Write-Host "API call attempt $attempt of $maxRetries"
+              }
+
+              try {
+                  if (Test-Path $responseFile) { Remove-Item $responseFile -Force }
+
+                  curl.exe --silent --show-error --output "$responseFile" `
+                      --request POST `
+                      --url "https://api.anthropic.com/v1/messages" `
+                      --header "x-api-key: $($env:ANTHROPIC_API_KEY)" `
+                      --header "anthropic-version: 2023-06-01" `
+                      --header "content-type: application/json" `
+                      --data-binary "@$bodyFile" `
+                      --max-time 300 `
+                      --tlsv1.2 `
+                      --connect-timeout 30
+
+                  $curlExitCode = $LASTEXITCODE
+                  Write-Host "curl exit code: $curlExitCode"
+
+                  if ($curlExitCode -ne 0) {
+                      $errDetail = if (Test-Path $responseFile) { Get-Content $responseFile -Raw -ErrorAction SilentlyContinue } else { "no response body" }
+                      throw "curl request failed (exit code $curlExitCode): $errDetail"
+                  }
+
+                  if (-not (Test-Path $responseFile) -or (Get-Item $responseFile).Length -eq 0) {
+                      throw "Empty or missing response from API"
+                  }
+
+                  $responseText = [System.IO.File]::ReadAllText($responseFile, [System.Text.Encoding]::UTF8)
+                  $response = $responseText | ConvertFrom-Json
+
+                  if ($response.type -eq "error") {
+                      throw "API error ($($response.error.type)): $($response.error.message)"
+                  }
+
+                  Write-Host "Claude API call successful on attempt $attempt"
+                  $success = $true
+
+                  $claudeResponse = $response.content[0].text
+                  Write-Host "Response received, length: $($claudeResponse.Length) characters"
+
+                  $claudeResponse | Out-File -FilePath "sync_response.txt" -Encoding UTF8
+
+              } catch {
+                  $lastError = $_
+                  $fullErrorText = $_.ToString()
+
+                  Write-Host "::warning::API call failed on attempt ${attempt}: $fullErrorText"
+
+                  $isRetryable = $false
+                  $retryablePatterns = @(
+                      "forcibly closed", "connection was closed", "timeout",
+                      "transport connection", "remote host",
+                      "exit code 7", "exit code 28", "exit code 35", "exit code 56",
+                      "overloaded_error", "rate_limit_error",
+                      "429", "500", "502", "503", "504", "529"
+                  )
+
+                  foreach ($pattern in $retryablePatterns) {
+                      if ($fullErrorText -like "*$pattern*") {
+                          $isRetryable = $true
+                          break
+                      }
+                  }
+
+                  if ($isRetryable -and $attempt -lt $maxRetries) {
+                      Write-Host "::warning::Retryable error detected, will retry..."
+                  } else {
+                      if ($attempt -ge $maxRetries) {
+                          Write-Host "::error::Max retries ($maxRetries) exhausted"
+                      }
+                      throw
+                  }
+              }
+          }
+
+          Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue
+          Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+
+          if (-not $success) {
+              Write-Host "::error::Failed to call Claude API after $maxRetries attempts"
+              if ($lastError) { throw $lastError }
+              else { throw "Claude API call failed after maximum retries" }
+          }
+
+      - name: Parse response and write updated files
+        id: parse
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host "PARSING CLAUDE RESPONSE"
+          Write-Host "========================================="
+
+          $claudeResponse = [System.IO.File]::ReadAllText((Resolve-Path "sync_response.txt").Path)
+
+          $hasEndTag = $claudeResponse.IndexOf('</SYNC_RESPONSE>') -ge 0
+          if (-not $hasEndTag) {
+              Write-Host "::warning::Response appears incomplete (missing </SYNC_RESPONSE>)"
+          }
+
+          $repoConfigStatus = "NO_CHANGES"
+          $repoConfigContent = $null
+          $rcStatusStart = $claudeResponse.IndexOf('<REPO_CONFIG>')
+          if ($rcStatusStart -ge 0) {
+              $rcStatusEnd = $claudeResponse.IndexOf('</REPO_CONFIG>', $rcStatusStart)
+              if ($rcStatusEnd -gt $rcStatusStart) {
+                  $rcSection = $claudeResponse.Substring($rcStatusStart, $rcStatusEnd - $rcStatusStart + '</REPO_CONFIG>'.Length)
+
+                  $statusStart = $rcSection.IndexOf('<STATUS>')
+                  $statusEnd = $rcSection.IndexOf('</STATUS>')
+                  if ($statusStart -ge 0 -and $statusEnd -gt $statusStart) {
+                      $repoConfigStatus = $rcSection.Substring($statusStart + '<STATUS>'.Length, $statusEnd - $statusStart - '<STATUS>'.Length).Trim()
+                  }
+
+                  if ($repoConfigStatus -eq "UPDATED") {
+                      $contentStart = $rcSection.IndexOf('<CONTENT>')
+                      $contentEnd = $rcSection.LastIndexOf('</CONTENT>')
+                      if ($contentStart -ge 0 -and $contentEnd -gt $contentStart) {
+                          $repoConfigContent = $rcSection.Substring($contentStart + '<CONTENT>'.Length, $contentEnd - $contentStart - '<CONTENT>'.Length).Trim()
+                          Write-Host "repo-config.md: UPDATED ($($repoConfigContent.Length) chars)"
+                      } else {
+                          Write-Host "::warning::REPO_CONFIG status is UPDATED but no CONTENT found"
+                          $repoConfigStatus = "NO_CHANGES"
+                      }
+                  } else {
+                      Write-Host "repo-config.md: NO_CHANGES"
+                  }
+              }
+          }
+
+          $roleFileStatus = "NO_CHANGES"
+          $roleFileContent = $null
+          $rfStatusStart = $claudeResponse.IndexOf('<ROLE_FILE>')
+          if ($rfStatusStart -ge 0) {
+              $rfStatusEnd = $claudeResponse.IndexOf('</ROLE_FILE>', $rfStatusStart)
+              if ($rfStatusEnd -gt $rfStatusStart) {
+                  $rfSection = $claudeResponse.Substring($rfStatusStart, $rfStatusEnd - $rfStatusStart + '</ROLE_FILE>'.Length)
+
+                  $statusStart = $rfSection.IndexOf('<STATUS>')
+                  $statusEnd = $rfSection.IndexOf('</STATUS>')
+                  if ($statusStart -ge 0 -and $statusEnd -gt $statusStart) {
+                      $roleFileStatus = $rfSection.Substring($statusStart + '<STATUS>'.Length, $statusEnd - $statusStart - '<STATUS>'.Length).Trim()
+                  }
+
+                  if ($roleFileStatus -eq "UPDATED") {
+                      $contentStart = $rfSection.IndexOf('<CONTENT>')
+                      $contentEnd = $rfSection.LastIndexOf('</CONTENT>')
+                      if ($contentStart -ge 0 -and $contentEnd -gt $contentStart) {
+                          $roleFileContent = $rfSection.Substring($contentStart + '<CONTENT>'.Length, $contentEnd - $contentStart - '<CONTENT>'.Length).Trim()
+                          Write-Host "role_app_ci.sql: UPDATED ($($roleFileContent.Length) chars)"
+                      } else {
+                          Write-Host "::warning::ROLE_FILE status is UPDATED but no CONTENT found"
+                          $roleFileStatus = "NO_CHANGES"
+                      }
+                  } else {
+                      Write-Host "role_app_ci.sql: NO_CHANGES"
+                  }
+              }
+          }
+
+          $summary = "No summary provided"
+          $sumStart = $claudeResponse.IndexOf('<SUMMARY>')
+          $sumEnd = $claudeResponse.IndexOf('</SUMMARY>')
+          if ($sumStart -ge 0 -and $sumEnd -gt $sumStart) {
+              $summary = $claudeResponse.Substring($sumStart + '<SUMMARY>'.Length, $sumEnd - $sumStart - '<SUMMARY>'.Length).Trim()
+          }
+          Write-Host "`nSummary: $summary"
+
+          # Parse the <DEPRECATED> block — orphan items that should not be
+          # auto-removed but must be surfaced to the reviewer.
+          $deprecated = "NONE"
+          $depStart = $claudeResponse.IndexOf('<DEPRECATED>')
+          $depEnd = $claudeResponse.IndexOf('</DEPRECATED>')
+          if ($depStart -ge 0 -and $depEnd -gt $depStart) {
+              $deprecated = $claudeResponse.Substring($depStart + '<DEPRECATED>'.Length, $depEnd - $depStart - '<DEPRECATED>'.Length).Trim()
+              if ([string]::IsNullOrWhiteSpace($deprecated)) { $deprecated = "NONE" }
+          }
+          Write-Host "Deprecated/orphan items: $deprecated"
+          $deprecated | Out-File "deprecated_items.txt" -Encoding UTF8
+
+          $hasDeprecated = ($deprecated -ne "NONE" -and -not [string]::IsNullOrWhiteSpace($deprecated))
+          if ($hasDeprecated) {
+              echo "HAS_DEPRECATED=true" >> $env:GITHUB_ENV
+          } else {
+              echo "HAS_DEPRECATED=false" >> $env:GITHUB_ENV
+          }
+
+          # If only orphans were found (no additive drift), still surface
+          # them via a workflow notice. Don't open a PR — there is nothing
+          # to commit. Exit cleanly.
+          if ($repoConfigStatus -eq "NO_CHANGES" -and $roleFileStatus -eq "NO_CHANGES") {
+              if ($hasDeprecated) {
+                  Write-Host "::warning::Orphan/deprecated config items detected — reviewer action required:"
+                  $deprecated -split "`n" | ForEach-Object { Write-Host "  $_" }
+              } else {
+                  Write-Host "`nNo configuration drift detected. Exiting cleanly."
+              }
+              echo "HAS_DRIFT=false" >> $env:GITHUB_ENV
+              exit 0
+          }
+
+          echo "HAS_DRIFT=true" >> $env:GITHUB_ENV
+
+          if ($repoConfigStatus -eq "UPDATED") {
+              $repoConfigPath = $env:REPO_CONFIG_PATH
+              [System.IO.File]::WriteAllText(
+                  (Resolve-Path $repoConfigPath).Path,
+                  $repoConfigContent,
+                  (New-Object System.Text.UTF8Encoding $false)
+              )
+              Write-Host "Wrote updated repo-config.md"
+          }
+
+          if ($roleFileStatus -eq "UPDATED") {
+              $roleFilePath = $env:ROLE_FILE_PATH
+              [System.IO.File]::WriteAllText(
+                  (Resolve-Path $roleFilePath).Path,
+                  $roleFileContent,
+                  (New-Object System.Text.UTF8Encoding $false)
+              )
+              Write-Host "Wrote updated role_app_ci.sql"
+          }
+
+          $summary | Out-File "drift_summary.txt" -Encoding UTF8
+
+      - name: Push to bot branch and create/update auto-merge PR
+        if: env.HAS_DRIFT == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          Write-Host "========================================="
+          Write-Host "PUSHING TO $env:SYNC_BRANCH AND ENSURING AUTO-MERGE PR"
+          Write-Host "========================================="
+
+          $branch = $env:SYNC_BRANCH
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Reset the bot branch to current master + our staged changes.
+          # We do NOT preserve any prior history on the bot branch — it's a
+          # disposable side branch that always represents "master + the
+          # latest reconciled config". This eliminates merge conflicts
+          # forever and avoids the "feature/skill-migration-generation-vN"
+          # version sprawl.
+          git checkout -B $branch
+
+          $repoConfigPath = $env:REPO_CONFIG_PATH
+          $roleFilePath = $env:ROLE_FILE_PATH
+
+          git add -- $repoConfigPath $roleFilePath
+
+          $status = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($status)) {
+              Write-Host "No staged changes to commit (drift was reported but files match master). Exiting."
+              exit 0
+          }
+
+          $summary = if (Test-Path "drift_summary.txt") { Get-Content "drift_summary.txt" -Raw } else { "Auto-detected configuration drift." }
+          $shortSummary = ($summary -split "`n")[0]
+          if ([string]::IsNullOrWhiteSpace($shortSummary)) { $shortSummary = "sync skill config with repository state" }
+
+          git commit -m "chore(sync): $shortSummary"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::commit failed"
+              exit 1
+          }
+
+          # Force-push: previous bot-branch state is stale once master moves.
+          git push --force-with-lease origin $branch
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::push to $branch failed"
+              exit 1
+          }
+          Write-Host "Pushed bot branch $branch"
+
+          # Find existing open PR from $branch -> master, if any.
+          $existing = gh pr list --state open --head $branch --json number,url,headRefName | ConvertFrom-Json
+          $prNumber = $null
+          $prUrl    = $null
+
+          if ($existing -and $existing.Count -gt 0) {
+              $prNumber = $existing[0].number
+              $prUrl    = $existing[0].url
+              Write-Host "Reusing existing PR #$prNumber ($prUrl)"
+          }
+
+          $deprecatedSection = ""
+          if (Test-Path "deprecated_items.txt") {
+              $depContent = (Get-Content "deprecated_items.txt" -Raw).Trim()
+              if ($depContent -ne "NONE" -and -not [string]::IsNullOrWhiteSpace($depContent)) {
+                  $deprecatedSection = "`n          ## :warning: Orphan items (manual review required)`n`n          The following items exist in config files but no longer have a matching folder/synonym on disk. They are NOT removed automatically — review and remove in a follow-up PR if intentional:`n`n          ``````n          $depContent`n          ``````n"
+              }
+          }
+
+          $prTitle = "chore(sync): $shortSummary"
+          $prBody = @"
+          ## Summary
+
+          $summary
+          $deprecatedSection
+          ## What changed
+
+          This PR was automatically generated by the ``sync-skill-config`` workflow after detecting drift between the repository filesystem and the skill config files. The PR reuses a single bot branch (``$branch``) — every drift event force-updates it instead of creating a new versioned branch.
+
+          ## Files reconciled
+
+          - ``$($env:REPO_CONFIG_PATH)``
+          - ``$($env:ROLE_FILE_PATH)``
+
+          ## Auto-merge
+
+          Auto-merge is enabled. The PR will merge itself the moment required status checks pass — no human action needed for non-functional config drift.
+
+          > Generated by ``sync-skill-config.yml``
+          "@
+
+          $bodyFile = Join-Path $env:RUNNER_TEMP "pr_body.md"
+          [System.IO.File]::WriteAllText($bodyFile, $prBody, (New-Object System.Text.UTF8Encoding $false))
+
+          if ($prNumber) {
+              gh pr edit $prNumber --title $prTitle --body-file $bodyFile
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::warning::failed to update existing PR body — continuing"
+              }
+          } else {
+              $createOutput = gh pr create --base master --head $branch --title $prTitle --body-file $bodyFile 2>&1
+              Write-Host $createOutput
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::error::failed to create PR"
+                  exit 1
+              }
+              # Capture the new PR number for auto-merge.
+              $newPr = gh pr list --state open --head $branch --json number,url --limit 1 | ConvertFrom-Json
+              if ($newPr -and $newPr.Count -gt 0) {
+                  $prNumber = $newPr[0].number
+                  $prUrl    = $newPr[0].url
+              }
+          }
+
+          if ($prNumber) {
+              Write-Host "Enabling auto-merge on PR #$prNumber"
+              gh pr merge $prNumber --auto --squash --delete-branch 2>&1 | Write-Host
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::warning::Could not enable auto-merge (likely needs to be enabled at repo level, or PR has no required checks). The PR is open and a maintainer can merge it manually."
+              }
+              Write-Host "::notice::sync-skill-config PR ready: $prUrl"
+          }
