@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# nitsql pre-commit hook (vendored)
+#
+# Runs the nitsql multi-dialect SQL analyzer on staged *.sql files.
+# Auto-detects dialect (MSSQL / PostgreSQL / Oracle / MySQL / SQLite).
+#
+#   CRITICAL → blocks the commit (exit 1)
+#   HIGH/MEDIUM/LOW → warns, allows the commit
+#   No SQL staged → exits silently
+#
+# Bypass (discouraged): git commit --no-verify
+# Authoritative gate is the nitsql GitHub Actions workflow — that
+# enforcement runs on every PR and cannot be bypassed.
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANALYZER="$HOOK_DIR/analyze_sql.py"
+
+# ---------------------------------------------------------------------------
+# Pass 0 — sql-doc-gate: block while branch *.sql changes are undocumented.
+# Runs before the analyzer so documentation is enforced even when the
+# analyzer or Python is unavailable.
+# ---------------------------------------------------------------------------
+bash "$HOOK_DIR/sql-doc-gate.sh"
+
+if [ ! -f "$ANALYZER" ]; then
+	echo "[nitsql] Analyzer missing at $ANALYZER — skipping."
+	echo "  Re-run .githooks/bootstrap.sh or restore the file from origin/master."
+	exit 0
+fi
+
+PYTHON=""
+for cmd in python python3 py; do
+	if command -v "$cmd" &>/dev/null; then
+		PYTHON="$cmd"
+		break
+	fi
+done
+if [ -z "$PYTHON" ]; then
+	echo "[nitsql] Python 3.8+ not found in PATH — skipping local check."
+	echo "  Install Python or use the CI workflow as the gate."
+	exit 0
+fi
+
+SQL_FILES=()
+while IFS= read -r f; do
+	[ -n "$f" ] && SQL_FILES+=("$f")
+done < <(git diff --cached --name-only --diff-filter=AMR -- '*.sql')
+
+if [ ${#SQL_FILES[@]} -eq 0 ]; then
+	exit 0
+fi
+
+echo "[nitsql] Checking ${#SQL_FILES[@]} staged SQL file(s)..."
+echo ""
+
+JSON_OUT="$(mktemp -t nitsql-XXXXXX.json 2>/dev/null || mktemp)"
+trap 'rm -f "$JSON_OUT"' EXIT
+
+set +e
+"$PYTHON" "$ANALYZER" --json "${SQL_FILES[@]}" > "$JSON_OUT" 2>/dev/null
+ANALYZER_EXIT=$?
+set -e
+
+TOTAL=$("$PYTHON" -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+    counts = d.get("severity_counts", {})
+    total = d.get("total_violations", 0)
+    c = counts.get("CRITICAL", 0)
+    h = counts.get("HIGH", 0)
+    m = counts.get("MEDIUM", 0)
+    l = counts.get("LOW", 0)
+    print(f"{total}|{c}|{h}|{m}|{l}")
+except Exception:
+    print("0|0|0|0|0")
+' "$JSON_OUT" 2>/dev/null)
+
+IFS='|' read -r TOTAL_V CRITICALS HIGHS MEDIUMS LOWS <<< "$TOTAL"
+for var in TOTAL_V CRITICALS HIGHS MEDIUMS LOWS; do
+	val="${!var:-0}"
+	if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+		printf -v "$var" '%s' 0
+	fi
+done
+
+if [ "$TOTAL_V" -eq 0 ]; then
+	echo "[nitsql] All clean — no issues found."
+	exit 0
+fi
+
+echo "────────────────────────────────────────────────────────────"
+"$PYTHON" "$ANALYZER" --fix "${SQL_FILES[@]}" 2>&1 || true
+echo "────────────────────────────────────────────────────────────"
+echo ""
+
+if [ "$CRITICALS" -gt 0 ]; then
+	echo "[nitsql] BLOCKED — $CRITICALS CRITICAL finding(s)."
+	echo "  Fix the issues above, re-stage, and commit."
+	echo "  Bypass (CI will still reject): git commit --no-verify"
+	exit 1
+fi
+
+echo "[nitsql] WARNING — $TOTAL_V finding(s): $HIGHS HIGH, $MEDIUMS MEDIUM, $LOWS LOW"
+echo "  Commit allowed. Fix before pushing or CI may reject."
+exit 0

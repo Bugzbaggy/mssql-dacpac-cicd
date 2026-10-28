@@ -1,0 +1,3069 @@
+name: Generate Migration Scripts with Claude
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - master
+    paths:
+      - 'AppDb_Analytics/**/*.sql'
+
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name to process (optional - defaults to current branch)'
+        required: false
+        type: string
+
+env:
+  DATABASE: 'AppDb_Analytics'
+
+concurrency:
+  group: generate-migration-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze-and-generate:
+    name: Analyze Changes and Generate Migration Scripts
+    runs-on: windows-latest
+    # The generator call is --max-time 3000 with up to 3 attempts, so without a
+    # ceiling a repeatedly-stalling API could hold this runner for ~2.5 hours.
+    timeout-minutes: 90
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref || github.ref }}
+
+      - name: Extract branch information
+        id: branch_info
+        shell: pwsh
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_INPUT_BRANCH: ${{ github.event.inputs.branch_name }}
+          GH_HEAD_REF: ${{ github.head_ref }}
+          GH_BASE_REF: ${{ github.base_ref }}
+          GH_REF_NAME: ${{ github.ref_name }}
+        run: |
+          if ($env:GH_EVENT_NAME -eq "workflow_dispatch" -and $env:GH_INPUT_BRANCH -ne "") {
+            $branch = $env:GH_INPUT_BRANCH
+          } elseif ($env:GH_EVENT_NAME -eq "pull_request") {
+            $branch = $env:GH_HEAD_REF
+          } else {
+            $branch = $env:GH_REF_NAME
+          }
+          # BRANCH_NAME stays the real git ref (may contain '/') and is used for every git
+          # operation (fetch/rebase/push). BRANCH_SLUG is the filesystem-safe form ('/' -> '.')
+          # used for migration filenames, glob patterns and deploy branch-matching - none of
+          # which can contain a path separator. Keep these two distinct.
+          echo "BRANCH_NAME=$branch" >> $env:GITHUB_ENV
+          $branchSlug = $branch -replace '/', '.'
+          echo "BRANCH_SLUG=$branchSlug" >> $env:GITHUB_ENV
+          Write-Host "Working with branch: $branch (slug: $branchSlug)"
+
+          $baseBranch = "master"
+          if ($env:GH_EVENT_NAME -eq "pull_request") {
+            $baseBranch = $env:GH_BASE_REF
+          }
+          echo "BASE_BRANCH=$baseBranch" >> $env:GITHUB_ENV
+          Write-Host "Comparing against base branch: $baseBranch"
+
+      - name: Detect schema changes
+        id: detect_changes
+        shell: pwsh
+        run: |
+          $baseBranch = $env:BASE_BRANCH
+          $currentBranch = $env:BRANCH_NAME
+
+          Write-Host "Fetching base branch: $baseBranch"
+          git fetch origin $baseBranch 2>&1 | Out-Null
+
+          Write-Host "Detecting changes between origin/$baseBranch and HEAD (with rename detection)"
+          $changedFiles = git diff --name-status -M90% "origin/$baseBranch...HEAD" -- "AppDb_Analytics/**/*.sql"
+
+          if ([string]::IsNullOrWhiteSpace($changedFiles)) {
+            Write-Host "::warning::No SQL file changes detected in AppDb_Analytics folder"
+            echo "HAS_CHANGES=false" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          Write-Host "Found changed SQL files:"
+          Write-Host $changedFiles
+
+          echo "HAS_CHANGES=true" >> $env:GITHUB_ENV
+
+          $changedFiles | Out-File -FilePath "changed_files.txt" -Encoding UTF8
+
+      - name: Pre-flight nitsql gate (CRITICAL -> block)
+        if: env.HAS_CHANGES == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f .githooks/analyze_sql.py ]; then
+            echo "::warning::.githooks/analyze_sql.py missing on this branch - fetching from origin/${BASE_BRANCH:-master}"
+            mkdir -p .githooks
+            # MSYS_NO_PATHCONV=1 prevents Git Bash on Windows runners from
+            # mangling the `ref:path` syntax (treating `:` as a path separator).
+            if ! MSYS_NO_PATHCONV=1 git show "origin/${BASE_BRANCH:-master}:.githooks/analyze_sql.py" > .githooks/analyze_sql.py 2>/dev/null; then
+              rm -f .githooks/analyze_sql.py
+              echo "::error::.githooks/analyze_sql.py missing on branch AND on origin/${BASE_BRANCH:-master}."
+              echo "::error::Vendor the nitsql hook on the base branch before re-running."
+              exit 1
+            fi
+            chmod +x .githooks/analyze_sql.py
+            echo "Borrowed analyzer from origin/${BASE_BRANCH:-master}"
+          fi
+
+          BASE_REF="origin/${BASE_BRANCH:-master}"
+          DB_PATH="${DATABASE:?DATABASE env not set}"
+
+          echo "Pre-flight scope: ${BASE_REF}...HEAD -- ${DB_PATH}/**/*.sql"
+
+          mapfile -t FILES < <(git diff --name-only --diff-filter=AMR "${BASE_REF}...HEAD" -- "${DB_PATH}/**/*.sql")
+
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "No source SQL files in scope - nothing to pre-flight."
+            exit 0
+          fi
+
+          echo "Pre-flight validating ${#FILES[@]} source SQL file(s):"
+          printf '  %s\n' "${FILES[@]}"
+          echo ""
+
+          set +e
+          python .githooks/analyze_sql.py --json "${FILES[@]}" > "$RUNNER_TEMP/nitsql_preflight.json"
+          ANALYZER_EXIT=$?
+          set -e
+
+          echo "------------------------------------------------------------"
+          python .githooks/analyze_sql.py --fix "${FILES[@]}" || true
+          echo "------------------------------------------------------------"
+
+          read TOTAL CRIT HIGH MED LOW <<<"$(python -c '
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          c = d.get("severity_counts", {})
+          print(d.get("total_violations", 0), c.get("CRITICAL", 0), c.get("HIGH", 0), c.get("MEDIUM", 0), c.get("LOW", 0))
+          ' "$RUNNER_TEMP/nitsql_preflight.json")"
+
+          {
+            echo "## Pre-flight nitsql results"
+            echo ""
+            echo "| Severity | Count |"
+            echo "| -------- | ----- |"
+            echo "| CRITICAL | $CRIT |"
+            echo "| HIGH     | $HIGH |"
+            echo "| MEDIUM   | $MED  |"
+            echo "| LOW      | $LOW  |"
+            echo "| **Total**| **$TOTAL** |"
+            echo ""
+            if [ "$CRIT" -gt 0 ]; then
+              echo "**Status:** :x: BLOCKED - $CRIT CRITICAL finding(s). Migration generation aborted."
+            elif [ "$TOTAL" -gt 0 ]; then
+              echo "**Status:** :warning: $TOTAL non-critical finding(s) - proceeding with generation."
+            else
+              echo "**Status:** :white_check_mark: All clean."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CRIT" -gt 0 ]; then
+            echo "::error::generate-migration-scripts BLOCKED - $CRIT CRITICAL finding(s) in source SQL. Fix nitsql violations before migration generation can run."
+            exit 1
+          fi
+
+          echo "Pre-flight passed - no CRITICAL findings in source SQL."
+
+      - name: Analyze PR impact
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          Write-Host "Analyzing PR impact (deterministic git search + Claude judgment)..."
+
+          $database = $env:DATABASE
+          $baseBranch = $env:BASE_BRANCH
+
+          function Write-FallbackImpact($reason) {
+            Write-Host "::warning::Impact analysis falling back ($reason) - emitting NONE-risk placeholder"
+            @{ schemas = @(); overallRisk = "NONE"; dependencies = @(); crossDatabaseImpact = @(); summary = "Impact analysis unavailable ($reason)" } |
+              ConvertTo-Json -Depth 6 | Out-File "impact_analysis.json" -Encoding UTF8
+          }
+
+          if (-not (Test-Path "changed_files.txt")) { Write-FallbackImpact "no changed_files.txt"; exit 0 }
+
+          $structureFolders = @('Tables','Synonyms','User Defined Types')
+          $objectFolders = @('Tables','Views','Stored Procedures','Stored Procedure','Functions','Triggers','Synonyms','User Defined Types')
+
+          # ---- Deterministic parse of the changed-file list (TSV, not regex) ----
+          $lines = (Get-Content "changed_files.txt" -Raw) -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          $changes = @()
+          foreach ($line in $lines) {
+            $parts = $line.Trim().Split("`t")
+            if ($parts.Count -lt 2) { continue }
+            $status = $parts[0].Trim()
+            $file = if ($status.StartsWith('R') -and $parts.Count -ge 3) { $parts[2].Trim() } else { $parts[1].Trim() }
+            $segs = $file.Split([char[]]@('/','\'))
+            $schema = $null; $folder = $null
+            for ($k = 0; $k -lt $segs.Count - 1; $k++) {
+              if ($objectFolders -contains $segs[$k+1]) { $schema = $segs[$k]; $folder = $segs[$k+1]; break }
+            }
+            if (-not $schema) { continue }
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($file)
+            $changes += [PSCustomObject]@{ Status = $status; File = $file; Schema = $schema; Folder = $folder; Name = $name }
+          }
+
+          if ($changes.Count -eq 0) {
+            @{ schemas = @(); overallRisk = "NONE"; dependencies = @(); crossDatabaseImpact = @(); summary = "No schemas affected" } |
+              ConvertTo-Json -Depth 6 | Out-File "impact_analysis.json" -Encoding UTF8
+            Write-Host "No schema-bearing changes detected"
+            exit 0
+          }
+
+          # ---- Deterministic git search: diffs for structure files + raw grep hits ----
+          $changedFilesBlock = ($changes | ForEach-Object { "$($_.Status)`t$($_.File)" }) -join "`n"
+
+          $diffSb = New-Object System.Text.StringBuilder
+          $grepSb = New-Object System.Text.StringBuilder
+          foreach ($c in $changes) {
+            if ($structureFolders -notcontains $c.Folder) { continue }
+
+            if ($c.Status -eq 'D' -or $c.Status -eq 'M' -or $c.Status.StartsWith('R')) {
+              $diff = (git diff "origin/$baseBranch...HEAD" -- $c.File 2>$null) -join "`n"
+              if ($diff) {
+                [void]$diffSb.AppendLine("<DIFF file=`"$($c.File)`" status=`"$($c.Status)`">")
+                [void]$diffSb.AppendLine($diff)
+                [void]$diffSb.AppendLine("</DIFF>")
+              }
+            }
+
+            # Raw repo-wide reference hits for dropped/modified structure objects.
+            if ($c.Status -eq 'D' -or $c.Status -eq 'M') {
+              $qualified = "$($c.Schema).$($c.Name)"
+              $bracketed = "[$($c.Schema)].[$($c.Name)]"
+              $hits = @()
+              $hits += @(git grep -n -F --no-color "$qualified" -- "$database/**/*.sql" 2>$null)
+              $hits += @(git grep -n -F --no-color "$bracketed" -- "$database/**/*.sql" 2>$null)
+              $hits = $hits | Where-Object { $_ } | Select-Object -Unique | Select-Object -First 80
+              if ($hits.Count -gt 0) {
+                [void]$grepSb.AppendLine("<HITS object=`"$qualified`" status=`"$($c.Status)`">")
+                foreach ($h in $hits) { [void]$grepSb.AppendLine($h) }
+                [void]$grepSb.AppendLine("</HITS>")
+              }
+            }
+          }
+
+          # ---- Deterministic context: known schemas + risk keywords ----
+          $excludeDirs = @('bin','obj','Scripts','Security','Storage','external-refs','Properties','.vs')
+          $knownSchemas = @('dbo')
+          if (Test-Path $database) {
+            $knownSchemas += @(Get-ChildItem -Path $database -Directory -ErrorAction SilentlyContinue |
+                               Where-Object { $excludeDirs -notcontains $_.Name } | Select-Object -ExpandProperty Name)
+          }
+          $highRiskKeywords = @('billing','financial','routing','live','real-time','payment','invoice','revenue','pricing','cost')
+
+          # ---- Build the prompt from the skill file + appended context ----
+          $skillPrompt = Get-Content ".claude/skills/sql-migration-generator/references/impact-analysis.md" -Raw
+          $ctxLines = @(
+            "",
+            "DATABASE: $database",
+            "KNOWN_SCHEMAS: $(($knownSchemas | Select-Object -Unique) -join ', ')",
+            "HIGH_RISK_KEYWORDS: $($highRiskKeywords -join ', ')",
+            "",
+            "CHANGED_FILES:",
+            $changedFilesBlock,
+            "",
+            "STRUCTURE_DIFFS:",
+            $diffSb.ToString(),
+            "",
+            "GREP_HITS:",
+            $grepSb.ToString()
+          )
+          $prompt = $skillPrompt + "`n" + ($ctxLines -join "`n")
+
+          if ([string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)) { Write-FallbackImpact "no API key"; exit 0 }
+
+          $apiBody = @{ model = "claude-opus-4-8"; max_tokens = 16000; messages = @(@{ role = "user"; content = $prompt }) } | ConvertTo-Json -Depth 10
+          $bodyFile = Join-Path $env:RUNNER_TEMP "impact_body.json"
+          [System.IO.File]::WriteAllText($bodyFile, $apiBody, (New-Object System.Text.UTF8Encoding $false))
+          $responseFile = Join-Path $env:RUNNER_TEMP "impact_response.json"
+
+          $claudeText = $null
+          $delay = 10
+          for ($attempt = 1; $attempt -le 3 -and -not $claudeText; $attempt++) {
+            if ($attempt -gt 1) { Start-Sleep -Seconds $delay; $delay *= 2 }
+            if (Test-Path $responseFile) { Remove-Item $responseFile -Force }
+            curl.exe --silent --show-error --output "$responseFile" --request POST `
+              --url "https://api.anthropic.com/v1/messages" `
+              --header "x-api-key: $($env:ANTHROPIC_API_KEY)" --header "anthropic-version: 2023-06-01" `
+              --header "content-type: application/json" --data-binary "@$bodyFile" `
+              --max-time 600 --tlsv1.2 --connect-timeout 30
+            if ($LASTEXITCODE -ne 0) { Write-Host "::warning::curl failed (exit $LASTEXITCODE) attempt $attempt"; continue }
+            if (-not (Test-Path $responseFile) -or (Get-Item $responseFile).Length -eq 0) { continue }
+            $resp = [System.IO.File]::ReadAllText($responseFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($resp.type -eq "error") { Write-Host "::warning::API error attempt ${attempt}: $($resp.error.message)"; continue }
+            # The text block by type, not by position: a model that thinks first returns a
+            # thinking block at content[0], whose .text is $null - which read as "Claude
+            # unreachable" and fell back to a NONE-risk placeholder.
+            $textBlock = @($resp.content | Where-Object { $_.type -eq 'text' }) | Select-Object -First 1
+            if (-not $textBlock) {
+              Write-Host "::error::Impact analysis: Claude's response has no text block (content: $((@($resp.content) | ForEach-Object { $_.type }) -join ', '); stop_reason=$($resp.stop_reason)) - failing rather than reporting no risk"
+              exit 1
+            }
+            $claudeText = [string]$textBlock.text
+          }
+          Remove-Item $bodyFile, $responseFile -Force -ErrorAction SilentlyContinue
+
+          if (-not $claudeText) { Write-FallbackImpact "Claude unreachable"; exit 0 }
+
+          $open = $claudeText.IndexOf("<IMPACT>"); $close = $claudeText.IndexOf("</IMPACT>")
+          if ($open -lt 0 -or $close -le $open) { Write-FallbackImpact "no <IMPACT> envelope"; exit 0 }
+          $json = $claudeText.Substring($open + 8, $close - ($open + 8)).Replace('```json','').Replace('```','').Trim()
+          try { $impact = $json | ConvertFrom-Json } catch { Write-FallbackImpact "unparseable JSON"; exit 0 }
+
+          $impact | ConvertTo-Json -Depth 6 | Out-File "impact_analysis.json" -Encoding UTF8
+          Write-Host "Impact analysis complete: $($impact.summary)"
+          Write-Host "  Overall risk: $($impact.overallRisk); dependencies: $(@($impact.dependencies).Count)"
+
+      - name: Delete old branch migration scripts
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Identifying and deleting old migration scripts for branch: $env:BRANCH_NAME"
+
+          if (-not (Test-Path "Migration")) {
+            Write-Host "Migration folder does not exist yet, skipping deletion"
+            exit 0
+          }
+
+          $branchPattern = "*.$($env:DATABASE).$($env:BRANCH_SLUG).sql"
+
+          Write-Host "Searching for scripts matching pattern: $branchPattern"
+          $oldScripts = Get-ChildItem -Path "Migration" -Filter $branchPattern -File -ErrorAction SilentlyContinue
+
+          if ($oldScripts -and $oldScripts.Count -gt 0) {
+            Write-Host "Found $($oldScripts.Count) old migration script(s) for this branch:"
+
+            $deletedCount = 0
+            foreach ($script in $oldScripts) {
+              try {
+                Write-Host "  Deleting: $($script.Name)"
+                Remove-Item $script.FullName -Force
+                git rm "Migration/$($script.Name)" 2>&1 | Out-Null
+                $deletedCount++
+              } catch {
+                Write-Host "::warning::Failed to delete $($script.Name): $_"
+              }
+            }
+
+            Write-Host "Successfully deleted $deletedCount old branch migration script(s)"
+          } else {
+            Write-Host "No old migration scripts found for this branch"
+          }
+
+      - name: Calculate next migration version
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host "CALCULATING NEXT MIGRATION VERSION"
+          Write-Host "========================================="
+
+          $defaultVersion = "V1.00001"
+
+          if (-not (Test-Path "Migration")) {
+            Write-Host "Migration folder does not exist, using default version: $defaultVersion"
+            echo "NEXT_VERSION=$defaultVersion" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          Write-Host "`nScanning Migration folder for existing version migration files..."
+          $versionFiles = Get-ChildItem -Path "Migration" -Filter "V*.sql" -File -ErrorAction SilentlyContinue
+
+          if (-not $versionFiles -or $versionFiles.Count -eq 0) {
+            Write-Host "No existing version migration files found, using default version: $defaultVersion"
+            echo "NEXT_VERSION=$defaultVersion" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          Write-Host "Found $($versionFiles.Count) version migration file(s)`n"
+
+          # Parse all versions into structured objects
+          $parsedVersions = @()
+          $versionGroups = @{}
+
+          foreach ($file in $versionFiles) {
+            $filename = $file.Name
+            Write-Host "  Processing: $filename"
+
+            if ($filename -match '^V(\d+)\.(\d+)__') {
+              $major = [int]$matches[1]
+              $minor = [int]$matches[2]
+              $versionKey = "V$major.$($minor.ToString().PadLeft(5, '0'))"
+
+              Write-Host "    -> Parsed version: $versionKey (Major: $major, Minor: $minor)"
+
+              $versionObj = [PSCustomObject]@{
+                FileName = $filename
+                Major = $major
+                Minor = $minor
+                VersionKey = $versionKey
+              }
+
+              $parsedVersions += $versionObj
+
+              # Track duplicate versions
+              if (-not $versionGroups.ContainsKey($versionKey)) {
+                $versionGroups[$versionKey] = @()
+              }
+              $versionGroups[$versionKey] += $filename
+            } else {
+              Write-Host "    -> WARNING: Could not parse version from filename" -ForegroundColor Yellow
+            }
+          }
+
+          if ($parsedVersions.Count -eq 0) {
+            Write-Host "`nNo valid version numbers found, using default version: $defaultVersion"
+            echo "NEXT_VERSION=$defaultVersion" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          # Check for duplicate versions
+          Write-Host "`n--- Checking for Duplicate Versions ---"
+          $hasDuplicates = $false
+          foreach ($version in $versionGroups.Keys | Sort-Object) {
+            if ($versionGroups[$version].Count -gt 1) {
+              Write-Host "::warning::DUPLICATE VERSION DETECTED: $version" -ForegroundColor Yellow
+              foreach ($file in $versionGroups[$version]) {
+                Write-Host "  - $file" -ForegroundColor Yellow
+              }
+              $hasDuplicates = $true
+            }
+          }
+          if (-not $hasDuplicates) {
+            Write-Host "✓ No duplicate versions detected"
+          }
+
+          # Sort versions to find the maximum
+          Write-Host "`n--- Sorting Versions ---"
+          $sortedVersions = $parsedVersions | Sort-Object -Property Major, Minor
+
+          Write-Host "All versions in order:"
+          foreach ($v in $sortedVersions) {
+            Write-Host "  $($v.VersionKey) -> $($v.FileName)"
+          }
+
+          # Get the maximum version
+          $maxVersion = $sortedVersions | Select-Object -Last 1
+          $maxMajor = $maxVersion.Major
+          $maxMinor = $maxVersion.Minor
+
+          Write-Host "`n--- Latest Version ---"
+          Write-Host "Latest version found: V$maxMajor.$($maxMinor.ToString().PadLeft(5, '0'))"
+          Write-Host "From file: $($maxVersion.FileName)"
+
+          # Calculate next version
+          Write-Host "`n--- Calculating Next Version ---"
+          $nextMajor = $maxMajor
+          $nextMinor = $maxMinor + 1
+
+          if ($nextMinor -gt 99999) {
+            $nextMajor = $maxMajor + 1
+            $nextMinor = 1
+
+            if ($nextMajor -gt 999) {
+              Write-Host "::error::Version number overflow - major version cannot exceed 999"
+              exit 1
+            }
+
+            Write-Host "Minor version overflow detected"
+            Write-Host "  -> Incrementing major version to $nextMajor"
+            Write-Host "  -> Resetting minor version to 1"
+          }
+
+          $nextVersion = "V$nextMajor.$($nextMinor.ToString().PadLeft(5, '0'))"
+
+          # Validate next version doesn't already exist
+          Write-Host "`n--- Validating Next Version ---"
+          if ($versionGroups.ContainsKey($nextVersion)) {
+            Write-Host "::error::Calculated next version $nextVersion already exists!"
+            Write-Host "Existing files with this version:"
+            foreach ($file in $versionGroups[$nextVersion]) {
+              Write-Host "  - $file"
+            }
+            Write-Host "`nThis indicates a version assignment problem. Please review Migration folder."
+            exit 1
+          }
+
+          Write-Host "✓ Next version $nextVersion is available (no conflicts)"
+
+          Write-Host "`n========================================="
+          Write-Host "RESULT: Next Version = $nextVersion"
+          Write-Host "========================================="
+
+          echo "NEXT_VERSION=$nextVersion" >> $env:GITHUB_ENV
+
+      - name: Prepare context for Claude
+        id: prepare_context
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Preparing context for Claude API..."
+
+          if ($env:NEXT_VERSION) {
+            Write-Host "Using calculated version: $env:NEXT_VERSION"
+          } else {
+            Write-Host "No version calculated (repeatable-only migration or version calculation skipped)"
+          }
+
+          $baseBranch = $env:BASE_BRANCH
+
+          $context = @{
+            Branch = $env:BRANCH_SLUG
+            Database = $env:DATABASE
+            Date = (Get-Date -Format "yyyy-MM-dd")
+            Changes = @{}
+          }
+
+          $changedFilesRaw = Get-Content "changed_files.txt" -Raw
+          $lines = $changedFilesRaw -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+          
+          $validChanges = 0
+          
+          foreach ($line in $lines) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            
+            $parts = $line -split "`t"
+            if ($parts.Count -lt 2) {
+              $parts = $line -split '\s+', 2
+            }
+            
+            if ($parts.Count -lt 2) { continue }
+            
+            $status = $parts[0].Trim()
+            $file = $parts[1].Trim()
+
+            # Handle rename status (R###) - use new file path ($parts[2])
+            if ($status -match '^R\d*$' -and $parts.Count -ge 3) {
+              $file = $parts[2].Trim()
+            }
+
+            if (-not (Test-Path $file -ErrorAction SilentlyContinue) -and $status -ne 'D') {
+              Write-Host "::warning::Skipping file for context (not found): $file"
+              continue
+            }
+            
+            $fileInfo = @{
+              Status = $status
+              File = $file
+            }
+            
+            try {
+              if ($status -eq "A") {
+                $fileContent = Get-Content $file -Raw -ErrorAction SilentlyContinue
+                $fileInfo.Content = $fileContent
+                $fileInfo.IsNew = $true
+                Write-Host "  Added to context: [NEW] $file"
+                $validChanges++
+              } elseif ($status -eq "M") {
+                $diff = git diff "origin/$baseBranch...HEAD" -- $file
+                $fileInfo.Diff = $diff
+                $fileInfo.IsNew = $false
+                $fileContent = Get-Content $file -Raw -ErrorAction SilentlyContinue
+                $fileInfo.Content = $fileContent
+                Write-Host "  Added to context: [MODIFIED] $file"
+                $validChanges++
+              } elseif ($status -eq "D") {
+                $fileInfo.IsDeleted = $true
+                # Get content of deleted file from base branch (where it still exists)
+                try {
+                  $deletedContent = git show "origin/${baseBranch}:$file" 2>$null
+                  if ($LASTEXITCODE -eq 0 -and $deletedContent) {
+                    $fileInfo.Content = $deletedContent -join "`n"
+                    Write-Host "  Added to context: [DELETED] $file (from origin/$baseBranch)"
+                  } else {
+                    Write-Host "  Added to context: [DELETED] $file (no content available)"
+                  }
+                } catch {
+                  Write-Host "  Added to context: [DELETED] $file (error: $_)"
+                }
+                $validChanges++
+              }
+            } catch {
+              Write-Host "::warning::Could not read file content for: $file - Error: $_"
+            }
+            
+            $context.Changes[$file] = $fileInfo
+          }
+          
+          if ($validChanges -eq 0) {
+            Write-Host "::error::No valid file changes detected with content"
+            echo "HAS_CHANGES=false" >> $env:GITHUB_ENV
+            exit 1
+          }
+          
+          Write-Host "`nContext prepared with $validChanges valid changes"
+          
+          $context | ConvertTo-Json -Depth 10 -Compress | Out-File "claude_context.json" -Encoding UTF8
+          Write-Host "Context saved to claude_context.json"
+
+      - name: Call Claude API
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          Write-Host "Calling Claude API to generate migration scripts..."
+          
+          if ([string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)) {
+            Write-Host "::error::ANTHROPIC_API_KEY not configured in GitHub Secrets"
+            exit 1
+          }
+          
+          $context = Get-Content "claude_context.json" -Raw | ConvertFrom-Json
+          $changesJson = $context.Changes | ConvertTo-Json -Depth 10
+          
+          $versionNumber = if ($env:NEXT_VERSION) { $env:NEXT_VERSION } else { "V1.00001" }
+
+          # Build prompt from SKILL files instead of inline StringBuilder
+          $skillPath = ".claude/skills/sql-migration-generator"
+          $skillContent = Get-Content "$skillPath/SKILL.md" -Raw
+          # Strip YAML frontmatter (--- ... ---)
+          $skillBody = $skillContent -replace '(?s)^---.*?---\s*', ''
+          $repoConfig = Get-Content "$skillPath/references/repo-config.md" -Raw
+          $idempotentPatterns = Get-Content "$skillPath/references/idempotent-patterns.md" -Raw
+          $columnModification = Get-Content "$skillPath/references/column-modification.md" -Raw
+          $sqlStandards = Get-Content "$skillPath/references/sql-standards.md" -Raw
+          $indexStandards = Get-Content "$skillPath/references/index-standards.md" -Raw
+          $securityConstraints = Get-Content "$skillPath/references/security-constraints.md" -Raw
+
+          $prompt = "$skillBody`n`n$repoConfig`n`n$idempotentPatterns`n`n$columnModification`n`n$sqlStandards`n`n$indexStandards`n`n$securityConstraints"
+
+          # Replace template variables with actual values
+          $prompt = $prompt -replace '\{\{BRANCH_NAME\}\}', $context.Branch
+          $prompt = $prompt -replace '\{\{DATABASE\}\}', $context.Database
+          $prompt = $prompt -replace '\{\{DATE\}\}', $context.Date
+          $prompt = $prompt -replace '\{\{NEXT_VERSION\}\}', $versionNumber
+          $prompt = $prompt -replace '\{\{CHANGED_FILES_JSON\}\}', $changesJson
+          
+          Write-Host "Prompt created, making API call..."
+          
+          # Output cap for the migration generator. Streaming is REQUIRED at this size:
+          # a non-streaming request this large times out at the HTTP layer before the
+          # model finishes, and a cap hit here is a hard failure (see stop_reason below).
+          $maxOutputTokens = 128000
+
+          $apiBody = @{
+            model = "claude-opus-4-8"
+            max_tokens = $maxOutputTokens
+            stream = $true
+            messages = @(
+              @{
+                role = "user"
+                content = $prompt
+              }
+            )
+          } | ConvertTo-Json -Depth 10
+
+          # Write API body to temp file for curl (avoids shell escaping issues)
+          $bodyFile = Join-Path $env:RUNNER_TEMP "claude_api_body.json"
+          [System.IO.File]::WriteAllText($bodyFile, $apiBody, (New-Object System.Text.UTF8Encoding $false))
+          $bodySizeKB = [math]::Round((Get-Item $bodyFile).Length / 1KB, 1)
+          Write-Host "Request body size: $bodySizeKB KB"
+
+          $responseFile = Join-Path $env:RUNNER_TEMP "claude_api_response.json"
+
+          $maxRetries = 3
+          $retryDelaySeconds = 10
+          $attempt = 0
+          $success = $false
+          $lastError = $null
+
+          while ($attempt -lt $maxRetries -and -not $success) {
+            $attempt++
+
+            if ($attempt -gt 1) {
+              Write-Host "Retry attempt $attempt of $maxRetries after $retryDelaySeconds seconds..."
+              Start-Sleep -Seconds $retryDelaySeconds
+              $retryDelaySeconds *= 2
+            } else {
+              Write-Host "API call attempt $attempt of $maxRetries"
+            }
+
+            try {
+              # Use curl.exe for reliable HTTPS on Windows runners
+              # (Invoke-RestMethod has .NET HttpClient TLS transport issues on GH Actions)
+              if (Test-Path $responseFile) { Remove-Item $responseFile -Force }
+
+              curl.exe --silent --show-error --output "$responseFile" `
+                --request POST `
+                --url "https://api.anthropic.com/v1/messages" `
+                --header "x-api-key: $($env:ANTHROPIC_API_KEY)" `
+                --header "anthropic-version: 2023-06-01" `
+                --header "content-type: application/json" `
+                --header "accept: text/event-stream" `
+                --data-binary "@$bodyFile" `
+                --no-buffer `
+                --max-time 3000 `
+                --speed-time 180 `
+                --speed-limit 1 `
+                --tlsv1.2 `
+                --connect-timeout 30
+
+              $curlExitCode = $LASTEXITCODE
+              Write-Host "curl exit code: $curlExitCode"
+
+              if ($curlExitCode -ne 0) {
+                # Cap this: with a streamed response the partial body can be several MB,
+                # which bloats the log annotation and feeds stray digits to the retry
+                # pattern matcher below (a "VARCHAR(500)" in truncated SQL must not read
+                # as an HTTP 500).
+                $errDetail = if (Test-Path $responseFile) {
+                  $errRaw = [System.IO.File]::ReadAllText($responseFile, [System.Text.Encoding]::UTF8)
+                  if ($errRaw.Length -gt 2000) { $errRaw.Substring(0, 2000) + "... [truncated, $($errRaw.Length) chars total]" } else { $errRaw }
+                } else { "no response body" }
+                throw "curl request failed (exit code $curlExitCode): $errDetail"
+              }
+
+              if (-not (Test-Path $responseFile) -or (Get-Item $responseFile).Length -eq 0) {
+                throw "Empty or missing response from API"
+              }
+
+              # A failed request returns one JSON object rather than an SSE stream,
+              # so branch on the body shape before walking events.
+              $probe = New-Object System.IO.StreamReader($responseFile, [System.Text.Encoding]::UTF8)
+              try { $firstLine = $probe.ReadLine() } finally { $probe.Dispose() }
+              if ($null -ne $firstLine -and $firstLine.TrimStart().StartsWith('{')) {
+                $responseText = [System.IO.File]::ReadAllText($responseFile, [System.Text.Encoding]::UTF8)
+                $errObj = $null
+                try { $errObj = $responseText | ConvertFrom-Json } catch { }
+                if ($errObj -and $errObj.type -eq "error") {
+                  throw "API error ($($errObj.error.type)): $($errObj.error.message)"
+                }
+                throw "Expected a text/event-stream response but received a plain JSON body"
+              }
+
+              # Reassemble the SSE stream. System.Text.Json is used instead of
+              # ConvertFrom-Json because a 128k-token response is ~9 MB across ~40k
+              # events, where the cmdlet costs ~36s of runner time against ~5s here.
+              # Only text_delta is accumulated - thinking_delta is reasoning, not
+              # migration output, and must never reach the generated script.
+              $textBuilder     = New-Object System.Text.StringBuilder
+              $streamStop      = $null
+              $streamInTokens  = 0
+              $streamOutTokens = 0
+              $sawMessageStop  = $false
+
+              $reader = New-Object System.IO.StreamReader($responseFile, [System.Text.Encoding]::UTF8)
+              try {
+                while ($null -ne ($line = $reader.ReadLine())) {
+                  if (-not $line.StartsWith("data:")) { continue }
+                  $payload = $line.Substring(5).Trim()
+                  if ([string]::IsNullOrWhiteSpace($payload) -or $payload -eq "[DONE]") { continue }
+
+                  $doc = $null
+                  try { $doc = [System.Text.Json.JsonDocument]::Parse($payload) } catch { continue }
+                  try {
+                    $root = $doc.RootElement
+                    $tEl = [System.Text.Json.JsonElement]::new()
+                    if (-not $root.TryGetProperty("type", [ref]$tEl)) { continue }
+
+                    switch ($tEl.GetString()) {
+                      "message_start" {
+                        $mEl = [System.Text.Json.JsonElement]::new()
+                        if ($root.TryGetProperty("message", [ref]$mEl)) {
+                          $uEl = [System.Text.Json.JsonElement]::new()
+                          if ($mEl.TryGetProperty("usage", [ref]$uEl)) {
+                            $vEl = [System.Text.Json.JsonElement]::new()
+                            if ($uEl.TryGetProperty("input_tokens", [ref]$vEl))  { $streamInTokens  = $vEl.GetInt32() }
+                            if ($uEl.TryGetProperty("output_tokens", [ref]$vEl)) { $streamOutTokens = $vEl.GetInt32() }
+                          }
+                        }
+                      }
+                      "content_block_delta" {
+                        $dEl = [System.Text.Json.JsonElement]::new()
+                        if ($root.TryGetProperty("delta", [ref]$dEl)) {
+                          $dtEl = [System.Text.Json.JsonElement]::new()
+                          if ($dEl.TryGetProperty("type", [ref]$dtEl) -and $dtEl.GetString() -eq "text_delta") {
+                            $txEl = [System.Text.Json.JsonElement]::new()
+                            if ($dEl.TryGetProperty("text", [ref]$txEl)) { [void]$textBuilder.Append($txEl.GetString()) }
+                          }
+                        }
+                      }
+                      "message_delta" {
+                        $dEl = [System.Text.Json.JsonElement]::new()
+                        if ($root.TryGetProperty("delta", [ref]$dEl)) {
+                          $srEl = [System.Text.Json.JsonElement]::new()
+                          if ($dEl.TryGetProperty("stop_reason", [ref]$srEl) -and $srEl.ValueKind -ne [System.Text.Json.JsonValueKind]::Null) {
+                            $streamStop = $srEl.GetString()
+                          }
+                        }
+                        $uEl = [System.Text.Json.JsonElement]::new()
+                        if ($root.TryGetProperty("usage", [ref]$uEl)) {
+                          $vEl = [System.Text.Json.JsonElement]::new()
+                          if ($uEl.TryGetProperty("output_tokens", [ref]$vEl)) { $streamOutTokens = $vEl.GetInt32() }
+                        }
+                      }
+                      "message_stop" { $sawMessageStop = $true }
+                      "error" {
+                        $eEl = [System.Text.Json.JsonElement]::new()
+                        if ($root.TryGetProperty("error", [ref]$eEl)) {
+                          $etEl = [System.Text.Json.JsonElement]::new()
+                          $emEl = [System.Text.Json.JsonElement]::new()
+                          $et = if ($eEl.TryGetProperty("type", [ref]$etEl)) { $etEl.GetString() } else { "unknown" }
+                          $em = if ($eEl.TryGetProperty("message", [ref]$emEl)) { $emEl.GetString() } else { "" }
+                          throw "API stream error (${et}): $em"
+                        }
+                        throw "API stream error (no detail supplied)"
+                      }
+                    }
+                  } finally { $doc.Dispose() }
+                }
+              } finally { $reader.Dispose() }
+
+              # No message_stop means the connection dropped part-way. That IS worth
+              # retrying, unlike a cap hit, so throw back into the retry loop.
+              if (-not $sawMessageStop) {
+                throw "Stream ended without message_stop - connection dropped mid-response"
+              }
+
+              $response = [pscustomobject]@{
+                stop_reason = $streamStop
+                usage       = [pscustomobject]@{ input_tokens = $streamInTokens; output_tokens = $streamOutTokens }
+              }
+              $claudeResponse = $textBuilder.ToString()
+
+              Write-Host "✓ Claude API call successful on attempt $attempt"
+              $success = $true
+
+              Write-Host "Claude response received, length: $($claudeResponse.Length) characters"
+              # Surface stop_reason + token usage so a partial/truncated response is
+              # diagnosable without re-running. "end_turn" = natural finish,
+              # "max_tokens" = output cap hit, "stop_sequence"/"tool_use" = other.
+              Write-Host "Claude stop_reason: $($response.stop_reason)"
+              Write-Host "Claude tokens: input=$($response.usage.input_tokens), output=$($response.usage.output_tokens)"
+
+              $claudeResponse | Out-File -FilePath "claude_response.txt" -Encoding UTF8
+              Write-Host "Raw response saved to claude_response.txt"
+
+              # A truncated response is unusable and must never become a migration
+              # script. Retrying cannot help - the same prompt overflows the same way -
+              # so fail the step outright rather than throwing into the retry loop.
+              if ($response.stop_reason -eq "max_tokens") {
+                Write-Host "::error::Claude hit the $maxOutputTokens-token output cap (stop_reason=max_tokens, output=$($response.usage.output_tokens) tokens). The generated migration is TRUNCATED and will not be committed. Split this PR into smaller changes, or raise the max_tokens value in .github/workflows/generate-migration-scripts.yml. The partial output is in the migration-debug-* artifact (claude_response.txt)."
+                exit 1
+              }
+              if ($response.stop_reason -eq "refusal") {
+                Write-Host "::error::Claude declined this request (stop_reason=refusal). No migration script was generated."
+                exit 1
+              }
+              
+              try {
+                Write-Host "Parsing Claude response..."
+                
+                $migrationScripts = @{
+                  repeatableMigration = $null
+                  versionMigration = $null
+                  summary = "Migration scripts generated"
+                }
+                
+                $responseEndTag = '</MIGRATION_RESPONSE>'
+                $hasCompleteResponse = $claudeResponse.IndexOf($responseEndTag) -ge 0
+                Write-Host "Response complete: $hasCompleteResponse"
+                
+                if (-not $hasCompleteResponse) {
+                  Write-Host "::warning::Claude response appears incomplete"
+                }
+                
+                $repStartTag = '<REPEATABLE_MIGRATION>'
+                $repEndTag = '</REPEATABLE_MIGRATION>'
+                $repStart = $claudeResponse.IndexOf($repStartTag)
+                
+                if ($repStart -ge 0) {
+                  $repEnd = $claudeResponse.IndexOf($repEndTag, $repStart)
+                  
+                  if ($repEnd -gt $repStart) {
+                    $repSection = $claudeResponse.Substring($repStart, $repEnd - $repStart + $repEndTag.Length)
+                    
+                    $filenameMatch = [regex]::Match($repSection, '<FILENAME>(.*?)</FILENAME>', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+                    if ($filenameMatch.Success) {
+                      $filename = $filenameMatch.Groups[1].Value.Trim()
+                      
+                      $contentStartTag = '<CONTENT>'
+                      $contentEndTag = '</CONTENT>'
+                      $contentStart = $repSection.IndexOf($contentStartTag)
+                      $contentEnd = $repSection.LastIndexOf($contentEndTag)
+                      
+                      if ($contentStart -ge 0 -and $contentEnd -gt $contentStart) {
+                        $contentStart += $contentStartTag.Length
+                        $content = $repSection.Substring($contentStart, $contentEnd - $contentStart).Trim()
+                        
+                        $migrationScripts.repeatableMigration = @{
+                          filename = $filename
+                          content = $content
+                        }
+                        Write-Host "✓ Extracted repeatable migration: $filename"
+                      }
+                    }
+                  }
+                }
+                
+                $verStartTag = '<VERSION_MIGRATION>'
+                $verEndTag = '</VERSION_MIGRATION>'
+                $verStart = $claudeResponse.IndexOf($verStartTag)
+                
+                if ($verStart -ge 0) {
+                  $verEnd = $claudeResponse.IndexOf($verEndTag, $verStart)
+                  
+                  if ($verEnd -gt $verStart) {
+                    $verSection = $claudeResponse.Substring($verStart, $verEnd - $verStart + $verEndTag.Length)
+                    
+                    $filenameMatch = [regex]::Match($verSection, '<FILENAME>(.*?)</FILENAME>', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+                    if ($filenameMatch.Success) {
+                      $filename = $filenameMatch.Groups[1].Value.Trim()
+                      
+                      $contentStartTag = '<CONTENT>'
+                      $contentEndTag = '</CONTENT>'
+                      $contentStart = $verSection.IndexOf($contentStartTag)
+                      $contentEnd = $verSection.LastIndexOf($contentEndTag)
+                      
+                      if ($contentStart -ge 0 -and $contentEnd -gt $contentStart) {
+                        $contentStart += $contentStartTag.Length
+                        $content = $verSection.Substring($contentStart, $contentEnd - $contentStart).Trim()
+                        
+                        $migrationScripts.versionMigration = @{
+                          filename = $filename
+                          content = $content
+                        }
+                        Write-Host "✓ Extracted version migration: $filename"
+                      }
+                    }
+                  }
+                }
+                
+                $summaryMatch = [regex]::Match($claudeResponse, '<SUMMARY>(.*?)</SUMMARY>', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+                if ($summaryMatch.Success) {
+                  $migrationScripts.summary = $summaryMatch.Groups[1].Value.Trim()
+                }
+                
+                if (-not $migrationScripts.repeatableMigration -and -not $migrationScripts.versionMigration) {
+                  # Parse extracted neither block. Check whether we can recover.
+                  # The later "Build repeatable migration from source files" step
+                  # builds R__ migrations DETERMINISTICALLY from source SQL and
+                  # OVERWRITES whatever Claude returned for repeatable migrations.
+                  # So if changes are repeatable-only (no Tables/Synonyms/UDTs),
+                  # Claude's output is functionally unused — there is no reason
+                  # to fail the workflow here.
+                  $needsVersion = $false
+                  if (Test-Path "impact_analysis.json") {
+                    $impact = Get-Content "impact_analysis.json" -Raw | ConvertFrom-Json
+                    foreach ($s in $impact.schemas) {
+                      if ($s.changeType -eq "structure") { $needsVersion = $true; break }
+                    }
+                  }
+
+                  if ($needsVersion) {
+                    Write-Host "::error::Structure-type changes detected — Claude's <VERSION_MIGRATION> block is required but could not be parsed."
+                    Write-Host "::error::Inspect the 'migration-debug-*' workflow artifact (claude_response.txt) for the raw output."
+                    throw "Failed to extract <VERSION_MIGRATION> from Claude response (structure changes required it)"
+                  }
+
+                  Write-Host "::notice::Claude response had no parsable migration blocks, but changes are repeatable-only. The source-build step will produce the R__ migration deterministically. Continuing."
+                }
+
+                $migrationScripts | ConvertTo-Json -Depth 10 | Out-File -FilePath "migration_scripts.json" -Encoding UTF8
+
+              } catch {
+                Write-Host "::error::Failed to parse Claude response: $_"
+                throw
+              }
+              
+            } catch {
+              $lastError = $_
+              $fullErrorText = $_.ToString()
+
+              Write-Host "::warning::API call failed on attempt ${attempt}: $fullErrorText"
+
+              $isRetryable = $false
+              $retryablePatterns = @(
+                "forcibly closed", "connection was closed", "timeout",
+                "transport connection", "remote host",
+                "exit code 7", "exit code 18", "exit code 28", "exit code 35", "exit code 56",
+                "connection dropped",
+                "overloaded_error", "rate_limit_error",
+                "429", "500", "502", "503", "504", "529"
+              )
+
+              foreach ($pattern in $retryablePatterns) {
+                if ($fullErrorText -like "*$pattern*") {
+                  $isRetryable = $true
+                  break
+                }
+              }
+
+              if ($isRetryable -and $attempt -lt $maxRetries) {
+                Write-Host "::warning::Retryable error detected on attempt $attempt of $maxRetries, will retry..."
+              } else {
+                if ($attempt -ge $maxRetries) {
+                  Write-Host "::error::Max retries ($maxRetries) exhausted"
+                }
+                throw
+              }
+            }
+          }
+
+          # Clean up temp files
+          Remove-Item $bodyFile -Force -ErrorAction SilentlyContinue
+          Remove-Item $responseFile -Force -ErrorAction SilentlyContinue
+
+          if (-not $success) {
+            Write-Host "::error::Failed to call Claude API after $maxRetries attempts"
+            if ($lastError) {
+              throw $lastError
+            } else {
+              throw "Claude API call failed after maximum retries"
+            }
+          }
+
+      - name: Build repeatable migration from source files
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host "BUILDING REPEATABLE MIGRATION FROM SOURCE FILES"
+          Write-Host "========================================="
+          Write-Host "Overriding Claude output with deterministic source content"
+
+          $date = Get-Date -Format "yyyy-MM-dd"
+          $filename = "R__${date}.$($env:DATABASE).$($env:BRANCH_SLUG).sql"
+
+          # Collect non-deleted repeatable object files
+          $changedFilesRaw = Get-Content "changed_files.txt" -Raw
+          $lines = $changedFilesRaw -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+          $repeatableFiles = @()
+          # Deleted repeatable objects (SP/View/Function/Trigger) must be
+          # explicitly dropped in the R__ migration. We can't read the source
+          # file (it no longer exists on this branch) — but we don't need to.
+          # Parse schema/name straight from the file path and emit
+          # DROP <TYPE> IF EXISTS [schema].[name]; GO. Tables/Synonyms/UDTs
+          # belong in V__ and are not handled here.
+          $deletedRepeatableObjects = @()
+
+          # Shared T-SQL helpers (also used by the object-order check): Get-CodeView,
+          # Get-BatchTrigger, Get-TableTriggers, Get-DefinedObject, Get-SqlReferences,
+          # Get-TypeUsers, ConvertTo-SqlKey and friends.
+          . (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/migration-objects.ps1')
+          # A trigger taken out of a modified table file must be dropped, as a
+          # deleted Triggers/ file is: compare the file with its version at the
+          # merge base, the base of the changed-file list.
+          $mergeBase = git merge-base "origin/$($env:BASE_BRANCH)" HEAD 2>$null
+          if ($LASTEXITCODE -ne 0 -or -not $mergeBase) {
+            $mergeBase = $null
+            Write-Host "::warning::No merge base with origin/$($env:BASE_BRANCH): triggers removed from table files will not be dropped"
+          }
+          $removedTriggers = @()
+
+          foreach ($line in $lines) {
+            $line = $line.Trim()
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+            $parts = $line -split "`t"
+            if ($parts.Count -lt 2) { $parts = $line -split '\s+', 2 }
+            if ($parts.Count -lt 2) { continue }
+
+            $status = $parts[0].Trim()
+            $file = $parts[1].Trim()
+
+            # `Stored Procedures?` accepts both singular and plural folder
+            # names. Matched type is normalized to canonical plural so the
+            # downstream tier map keyed on 'Stored Procedures' still resolves.
+            if ($status -ne 'D' -and $file -match "[/\\](Views|Stored Procedures?|Functions|Triggers)[/\\]") {
+              if (Test-Path $file -ErrorAction SilentlyContinue) {
+                $normalizedType = if ($matches[1] -eq 'Stored Procedure') { 'Stored Procedures' } else { $matches[1] }
+                $repeatableFiles += @{ File = $file; Status = $status; Type = $normalizedType }
+              }
+            }
+            elseif ($status -ne 'D' -and $file -match "[/\\](Tables|Synonyms|Security)[/\\]") {
+              # The CI/CD deploy role (role_app_ci) is privileged and managed
+              # out-of-band; its grants are self-referential and cannot be applied by
+              # the deploy login itself, so it must never be folded into a migration.
+              if ($file -notmatch "[/\\]role_app_ci\.sql$" -and (Test-Path $file -ErrorAction SilentlyContinue)) {
+                $tempContent = Get-Content $file -Raw -ErrorAction SilentlyContinue
+                # A table file's triggers go to R__ along with its grants.
+                $fileTriggers = @()
+                if ($file -match "([^/\\]+)[/\\]Tables[/\\]") {
+                  $fileSchema = $matches[1]
+                  $fileTriggers = @(Get-TableTriggers $tempContent $fileSchema)
+                  if ($status -eq 'M' -and $mergeBase) {
+                    # cat-file, not show: show first stats "<rev>:<path>" as a file name,
+                    # which fails once the full path passes MAX_PATH.
+                    $baseContent = (git cat-file -p "${mergeBase}:$file" 2>$null) -join "`n"
+                    $kept = @($fileTriggers | ForEach-Object { "$($_.Schema).$($_.Name)" })
+                    foreach ($t in @(Get-TableTriggers $baseContent $fileSchema)) {
+                      if ($kept -notcontains "$($t.Schema).$($t.Name)") {
+                        $removedTriggers += @{ Schema = $t.Schema; Name = $t.Name; SqlType = 'TRIGGER'; File = $file }
+                      }
+                    }
+                  }
+                }
+                if ($tempContent -match '(?i)(GRANT|REVOKE|DENY)\s+' -or $fileTriggers.Count -gt 0) {
+                  $repeatableFiles += @{ File = $file; Status = $status; Type = "Permissions" }
+                }
+              }
+            }
+            elseif ($status -eq 'D' -and $file -match "[/\\]([^/\\]+)[/\\](Views|Stored Procedures?|Functions|Triggers)[/\\]([^/\\]+)\.sql$") {
+              # Deleted repeatable object — parse from path, no Test-Path
+              # needed (file is gone on this branch).
+              $delSchema = $matches[1]
+              $delFolder = $matches[2]
+              $delName   = $matches[3]
+              $sqlType = switch -Wildcard ($delFolder) {
+                'Stored Procedure*' { 'PROCEDURE' }
+                'Views'             { 'VIEW' }
+                'Functions'         { 'FUNCTION' }
+                'Triggers'          { 'TRIGGER' }
+              }
+              # The deleted file's own CREATE names the object when the path
+              # doesn't (a file can sit in another schema's folder).
+              if ($mergeBase) {
+                $delDefined = Get-DefinedObject ((git cat-file -p "${mergeBase}:$file" 2>$null) -join "`n")
+                if ($delDefined) { $delSchema = $delDefined.Schema; $delName = $delDefined.Name; $sqlType = $delDefined.Kind }
+              }
+              $deletedRepeatableObjects += @{
+                Schema  = $delSchema
+                Name    = $delName
+                SqlType = $sqlType
+                File    = $file
+              }
+            }
+          }
+
+          # Objects the V__ drops, which the R__ must re-create. A changed
+          # user-defined type can only be dropped once nothing references it, and
+          # Claude sees only the changed files, not every user of the type: so
+          # before each DROP TYPE, drop whatever referenced the type at the merge
+          # base. Every procedure, function, view or trigger the V__ drops that
+          # still exists in source is then re-created by the R__, which runs after
+          # the V__.
+          $vScripts = if (Test-Path "migration_scripts.json") { Get-Content "migration_scripts.json" -Raw | ConvertFrom-Json } else { $null }
+          $vContent = if ($vScripts -and $vScripts.versionMigration) { [string]$vScripts.versionMigration.content } else { '' }
+          if ($vContent -match '(?i)\bDROP\s+(TYPE|PROC|PROCEDURE|FUNCTION|VIEW|TRIGGER)\b') {
+            # Every repeatable object defined in source now, and its file.
+            $repoRoot = (Get-Location).ProviderPath.TrimEnd('\', '/')
+            $catalogue = @{}
+            foreach ($sf in @(Get-ChildItem -Path $env:DATABASE -Recurse -Filter *.sql -File -ErrorAction SilentlyContinue)) {
+              $rel = $sf.FullName.Substring($repoRoot.Length + 1).Replace('\', '/')
+              if ($rel -match '[/\\](Views|Stored Procedures?|Functions|Triggers)[/\\]') {
+                $folderType = if ($matches[1] -like 'Stored Procedure*') { 'Stored Procedures' } else { $matches[1] }
+                $d = Get-DefinedObject ([System.IO.File]::ReadAllText($sf.FullName))
+                if ($d) { $catalogue[$d.Key] = @{ File = $rel; Type = $folderType } }
+              } elseif ($rel -match '([^/\\]+)[/\\]Tables[/\\]') {
+                foreach ($t in @(Get-TableTriggers ([System.IO.File]::ReadAllText($sf.FullName)) $matches[1])) { $catalogue[$t.Key] = @{ File = $rel; Type = 'Permissions' } }
+              }
+            }
+            $dropRx = "(?i)\bDROP\s+(?<kind>TYPE|PROCEDURE|PROC|FUNCTION|VIEW|TRIGGER)\s+(?:IF\s+EXISTS\s+)?(?<names>$SqlDefName(?:\s*,\s*$SqlDefName)*)"
+            $dropped = New-Object System.Collections.Generic.List[string]
+            $newBatches = New-Object System.Collections.Generic.List[string]
+            $insertedDrops = 0
+            foreach ($b in ($vContent -split '(?m)^\s*GO\s*$')) {
+              if ([string]::IsNullOrWhiteSpace($b)) { continue }
+              foreach ($m in [regex]::Matches((Get-CodeView $b), $dropRx)) {
+                foreach ($nm in [regex]::Matches($m.Groups['names'].Value, $SqlDefName)) {
+                  $k = ConvertTo-SqlKey $nm.Value
+                  if ($m.Groups['kind'].Value -notmatch '(?i)^TYPE$') { $dropped.Add($k.Key); continue }
+                  foreach ($dep in @(Get-TypeUsers $mergeBase $env:DATABASE $k.Schema $k.Name)) {
+                    if ($dep.Kind -in @('TYPE', 'COLUMN')) {
+                      Write-Host "::warning::$($dep.Path): $($dep.Kind.ToLower()) $($dep.Key) uses type $($k.Key) - the V__ must change it before it drops the type"
+                      continue
+                    }
+                    if ($dropped.Contains($dep.Key)) { continue }
+                    $newBatches.Add("-- Drop $($dep.Schema).$($dep.Name): it references type $($k.Schema).$($k.Name), dropped next; the repeatable migration re-creates it`nDROP $($dep.Kind) IF EXISTS [$($dep.Schema)].[$($dep.Name)];")
+                    $dropped.Add($dep.Key); $insertedDrops++
+                    Write-Host "V__: dropping [$($dep.Schema)].[$($dep.Name)] before DROP TYPE [$($k.Schema)].[$($k.Name)] (it references the type)"
+                  }
+                }
+              }
+              $newBatches.Add($b.Trim())
+            }
+            if ($insertedDrops -gt 0) {
+              $vScripts.versionMigration.content = ($newBatches -join "`nGO`n`n") + "`nGO"
+              $vScripts | ConvertTo-Json -Depth 10 | Out-File "migration_scripts.json" -Encoding UTF8
+            }
+            foreach ($key in ($dropped | Select-Object -Unique)) {
+              $entry = $catalogue[$key]
+              if (-not $entry -or @($repeatableFiles | Where-Object { $_.File -eq $entry.File }).Count) { continue }
+              $repeatableFiles += @{ File = $entry.File; Status = 'M'; Type = $entry.Type }
+              Write-Host "R__: re-creating $key from $($entry.File) - the V__ drops it"
+            }
+          }
+          # The git lookups above are best-effort, and Actions ends a pwsh step
+          # with the last native exit code: don't let a failed one fail the step.
+          $global:LASTEXITCODE = 0
+
+          # Drop each trigger a table file no longer defines, unless the branch
+          # still defines it somewhere (say it moved to its own Triggers/ file).
+          # That search is loose on purpose: a missed drop leaves the trigger as
+          # it was, but a wrong one would remove it from the database.
+          if ($removedTriggers.Count -gt 0) {
+            $dbRoot = (Get-Item -LiteralPath $env:DATABASE -ErrorAction SilentlyContinue).FullName
+            $sourceFiles = @(if ($dbRoot) { Get-ChildItem -LiteralPath $dbRoot -Recurse -Filter *.sql -File -ErrorAction SilentlyContinue })
+            $definedIn = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($sf in $sourceFiles) {
+              foreach ($m in [regex]::Matches([System.IO.File]::ReadAllText($sf.FullName), '(?i)\bCREATE\s+(?:OR\s+ALTER\s+)?TRIGGER\s+(?:\[?\w+\]?\s*\.\s*)?\[?(\w+)\]?')) {
+                if (-not $definedIn.ContainsKey($m.Groups[1].Value)) { $definedIn[$m.Groups[1].Value] = "$($env:DATABASE)/" + $sf.FullName.Substring($dbRoot.Length + 1).Replace('\', '/') }
+              }
+            }
+            foreach ($t in $removedTriggers) {
+              if ($sourceFiles.Count -eq 0) {
+                Write-Host "::warning::Could not read the $($env:DATABASE) source tree: trigger [$($t.Schema)].[$($t.Name)], removed from $($t.File), is not dropped"
+              } elseif ($definedIn.ContainsKey($t.Name)) {
+                Write-Host "Trigger [$($t.Schema)].[$($t.Name)] left $($t.File), but $($definedIn[$t.Name]) still has a CREATE TRIGGER for it: not dropped"
+              } else {
+                Write-Host "Trigger [$($t.Schema)].[$($t.Name)] was removed from $($t.File): dropping it"
+                $deletedRepeatableObjects += $t
+              }
+            }
+          }
+
+          if ($repeatableFiles.Count -eq 0 -and $deletedRepeatableObjects.Count -eq 0) {
+            Write-Host "No repeatable source files or deletions found, keeping Claude output"
+            exit 0
+          }
+
+          Write-Host "Building from $($repeatableFiles.Count) source file(s):`n"
+
+          # ---- Dependency-aware ordering ---------------------------------
+          # See `.claude/skills/sql-migration-generator/references/dependency-ordering.md`
+          # for the algorithm + rationale.
+          #
+          # Tier priority: Functions (1) < Views (2) < SPs (3) < Triggers (4)
+          # Permissions files (a structure file's grants, plus any triggers a
+          # table file defines) run with their underlying object's tier
+          # (Permissions, like Triggers, has no dependents → tier 4).
+          $tierOf = @{
+              'Functions'         = 1
+              'Views'             = 2
+              'Stored Procedures' = 3
+              'Triggers'          = 4
+              'Permissions'       = 4
+          }
+
+          # Step 1: identify each file's object. A view/procedure/function/trigger
+          # file is named by its own CREATE statement, with the path as fallback (a
+          # file can sit in another schema's folder); a table/synonym/security/UDT
+          # file by its path. Two files that resolve to one name both stay in.
+          $items = @()
+          $nameCount = @{}
+          foreach ($fi in $repeatableFiles) {
+              $segments = $fi.File -split '[/\\]'
+              $schema = $null
+              $name   = $null
+              for ($k = 0; $k -lt $segments.Count - 1; $k++) {
+                  if ($segments[$k+1] -in @('Tables','Views','Stored Procedures','Stored Procedure','Functions','Triggers','User Defined Types','Synonyms','Security')) {
+                      $schema = $segments[$k]
+                      break
+                  }
+              }
+              if (-not $schema) { $schema = 'dbo' }
+              $name = [System.IO.Path]::GetFileNameWithoutExtension($fi.File)
+              $raw = if (Test-Path $fi.File) { [System.IO.File]::ReadAllText((Resolve-Path $fi.File).Path) } else { '' }
+              if ($fi.Type -ne 'Permissions') {
+                  $defined = Get-DefinedObject $raw
+                  if ($defined) { $schema = $defined.Schema; $name = $defined.Name }
+              }
+              $id = "$schema.$name".ToLowerInvariant()
+              $nameCount[$id] = 1 + [int]$nameCount[$id]
+              $items += @{
+                  File   = $fi.File
+                  Status = $fi.Status
+                  Type   = $fi.Type
+                  Schema = $schema
+                  Name   = $name
+                  Id     = $id
+                  Node   = $(if ($nameCount[$id] -eq 1) { $id } else { "$id#$($nameCount[$id])" })
+                  Tier   = $tierOf[$fi.Type]
+                  Raw    = $raw
+              }
+          }
+
+          # Step 2: what each item's R__ batches reference, read with the same
+          # lexer the order check uses: comments and string literals don't count
+          # (a `-- references cc.vwOrderTotal` line or a '--' literal can't fake or
+          # hide an edge), dynamic SQL does. A table file puts only its grants and
+          # triggers in the R__, and only its triggers can reference other objects.
+          foreach ($it in $items) {
+              $text = $it.Raw
+              if ($it.Type -eq 'Permissions') {
+                  $text = if ($it.File -match '[/\\]Tables[/\\]') { (@(Get-TableTriggers $text $it.Schema) | ForEach-Object { $_.Batch }) -join "`nGO`n" } else { '' }
+              }
+              $it.Refs = New-Object 'System.Collections.Generic.HashSet[string]'
+              foreach ($r in @(Get-SqlReferences (Get-CodeView $text) $env:DATABASE)) { [void]$it.Refs.Add($r.Key) }
+          }
+
+          # Step 3: build adjacency — edge A -> B means "A references B": any name
+          # form ([schema].[name], schema.name, a dbo object by its bare name).
+          # Nothing has to be created after a table's grants or triggers, so a
+          # table is never a target.
+          $idToItem = @{}
+          $nodesOfId = @{}
+          foreach ($it in $items) {
+              $idToItem[$it.Node] = $it
+              if ($it.Type -ne 'Permissions') { if (-not $nodesOfId.ContainsKey($it.Id)) { $nodesOfId[$it.Id] = @() }; $nodesOfId[$it.Id] += $it.Node }
+          }
+          $deps = @{}
+          foreach ($it in $items) { $deps[$it.Node] = New-Object System.Collections.Generic.HashSet[string] }
+          foreach ($it in $items) {
+              foreach ($ref in $it.Refs) {
+                  if ($ref -eq $it.Id -or -not $nodesOfId.ContainsKey($ref)) { continue }
+                  foreach ($n in $nodesOfId[$ref]) { [void]$deps[$it.Node].Add($n) }
+              }
+          }
+          # Must-precede edges: CREATE VIEW and CREATE FUNCTION resolve the views
+          # and functions they name when they are created, and a function must
+          # exist before anything that calls it. Everything else a procedure or
+          # trigger names (tables, views, other procedures) is resolved at run time.
+          function Test-MustPrecede($from, $to) {
+              ($to.Type -eq 'Functions') -or ($to.Type -eq 'Views' -and $from.Type -in @('Views', 'Functions'))
+          }
+
+          # Step 4: order. Cycles (procedures that call each other, say) are the
+          # strongly connected components (Tarjan); the components are sorted
+          # topologically (Kahn), taking the ready one with the lowest (tier, name)
+          # first, so every edge between components is respected. Inside a cycle
+          # only must-precede edges are enforced, then (tier, name).
+          $nodes = @($deps.Keys | Sort-Object)
+          $index = @{}; $low = @{}; $compOf = @{}
+          $onStack = New-Object System.Collections.Generic.HashSet[string]
+          $tarjan = New-Object System.Collections.Generic.Stack[string]
+          $components = New-Object System.Collections.ArrayList
+          $counter = 0
+          foreach ($root in $nodes) {
+              if ($index.ContainsKey($root)) { continue }
+              $index[$root] = $counter; $low[$root] = $counter; $counter++
+              $tarjan.Push($root); [void]$onStack.Add($root)
+              $work = New-Object System.Collections.Generic.Stack[object]
+              $work.Push([pscustomobject]@{ Node = $root; Next = @($deps[$root] | Sort-Object); At = 0 })
+              while ($work.Count -gt 0) {
+                  $f = $work.Peek()
+                  if ($f.At -lt $f.Next.Count) {
+                      $w = $f.Next[$f.At]; $f.At++
+                      if (-not $index.ContainsKey($w)) {
+                          $index[$w] = $counter; $low[$w] = $counter; $counter++
+                          $tarjan.Push($w); [void]$onStack.Add($w)
+                          $work.Push([pscustomobject]@{ Node = $w; Next = @($deps[$w] | Sort-Object); At = 0 })
+                      } elseif ($onStack.Contains($w)) {
+                          $low[$f.Node] = [Math]::Min($low[$f.Node], $index[$w])
+                      }
+                  } else {
+                      [void]$work.Pop()
+                      if ($work.Count -gt 0) { $p = $work.Peek().Node; $low[$p] = [Math]::Min($low[$p], $low[$f.Node]) }
+                      if ($low[$f.Node] -eq $index[$f.Node]) {
+                          $members = New-Object System.Collections.Generic.List[string]
+                          do { $w = $tarjan.Pop(); [void]$onStack.Remove($w); $members.Add($w); $compOf[$w] = $components.Count } while ($w -ne $f.Node)
+                          [void]$components.Add($members)
+                      }
+                  }
+              }
+          }
+          function Get-Rank([string]$node) { '{0}|{1}' -f $idToItem[$node].Tier, $node }
+          $compDeps = @{}; $compUsers = @{}; $compRank = @{}
+          for ($c = 0; $c -lt $components.Count; $c++) {
+              $compDeps[$c] = New-Object System.Collections.Generic.HashSet[int]
+              $compUsers[$c] = New-Object System.Collections.Generic.List[int]
+              $compRank[$c] = $null
+              foreach ($m in $components[$c]) { $r = Get-Rank $m; if ($null -eq $compRank[$c] -or [string]::CompareOrdinal($r, $compRank[$c]) -lt 0) { $compRank[$c] = $r } }
+          }
+          foreach ($v in $nodes) {
+              foreach ($w in $deps[$v]) {
+                  if ($compOf[$v] -ne $compOf[$w] -and $compDeps[$compOf[$v]].Add($compOf[$w])) { $compUsers[$compOf[$w]].Add($compOf[$v]) }
+              }
+          }
+          $pending = @{}; $ready = New-Object System.Collections.Generic.List[int]
+          for ($c = 0; $c -lt $components.Count; $c++) { $pending[$c] = $compDeps[$c].Count; if ($pending[$c] -eq 0) { $ready.Add($c) } }
+          $sortedIds = New-Object System.Collections.ArrayList
+          $mustCycle = New-Object System.Collections.Generic.HashSet[string]
+          while ($ready.Count -gt 0) {
+              $best = 0
+              for ($k = 1; $k -lt $ready.Count; $k++) { if ([string]::CompareOrdinal($compRank[$ready[$k]], $compRank[$ready[$best]]) -lt 0) { $best = $k } }
+              $c = $ready[$best]; $ready.RemoveAt($best)
+              $ranks = New-Object System.Collections.Generic.List[string]
+              foreach ($x in $components[$c]) { $ranks.Add((Get-Rank $x)) }
+              $ranks.Sort([System.StringComparer]::Ordinal)
+              $members = @($ranks | ForEach-Object { $_.Substring($_.IndexOf('|') + 1) })
+              if ($members.Count -eq 1) {
+                  [void]$sortedIds.Add($members[0])
+              } else {
+                  $placed = New-Object System.Collections.Generic.HashSet[string]
+                  $left = New-Object System.Collections.Generic.List[string]; foreach ($x in $members) { $left.Add($x) }
+                  while ($left.Count -gt 0) {
+                      $pick = $null
+                      foreach ($x in $left) {
+                          $blocked = $false
+                          foreach ($d in $deps[$x]) { if ($left.Contains($d) -and -not $placed.Contains($d) -and (Test-MustPrecede $idToItem[$x] $idToItem[$d])) { $blocked = $true; break } }
+                          if (-not $blocked) { $pick = $x; break }
+                      }
+                      if (-not $pick) {
+                          # Views/functions that name each other: no order satisfies them all.
+                          Write-Host "::warning::Views/functions reference each other in a cycle, so no order satisfies them all: $($left -join ', ')"
+                          foreach ($x in $left) { [void]$mustCycle.Add($x); [void]$sortedIds.Add($x) }
+                          break
+                      }
+                      [void]$sortedIds.Add($pick); [void]$placed.Add($pick); [void]$left.Remove($pick)
+                  }
+                  Write-Host "Dependency cycle among $($members.Count) objects: $($members -join ', '). Ordered by tier then name, views and functions after what they need; what procedures and triggers reference is resolved at run time."
+              }
+              foreach ($u in $compUsers[$c]) { $pending[$u]--; if ($pending[$u] -eq 0) { $ready.Add($u) } }
+          }
+
+          # Self-check: every object is emitted exactly once, and each must-precede
+          # edge points backwards unless both ends are in a cycle reported above.
+          # A failure is a bug in the ordering above; the R__ would not deploy.
+          $posOf = @{}; for ($k = 0; $k -lt $sortedIds.Count; $k++) { $posOf[$sortedIds[$k]] = $k }
+          if ($sortedIds.Count -ne $items.Count -or $posOf.Count -ne $items.Count) {
+              Write-Host "::error::R__ ordering emitted $($sortedIds.Count) object(s) for $($items.Count) - not writing the migration"
+              exit 1
+          }
+          $outOfOrder = @()
+          foreach ($v in $nodes) {
+              foreach ($w in $deps[$v]) {
+                  if ((Test-MustPrecede $idToItem[$v] $idToItem[$w]) -and $posOf[$w] -gt $posOf[$v] -and -not ($mustCycle.Contains($v) -and $mustCycle.Contains($w))) { $outOfOrder += "$v needs $w first" }
+              }
+          }
+          if ($outOfOrder.Count -gt 0) {
+              Write-Host "::error::R__ ordering bug: $($outOfOrder -join '; ') - not writing the migration"
+              exit 1
+          }
+
+          # Map sorted ids back to fileInfo objects, preserving the original
+          # fileInfo shape the rest of the build step expects.
+          $orderedRepeatableFiles = @()
+          foreach ($id in $sortedIds) {
+              $it = $idToItem[$id]
+              $orderedRepeatableFiles += @{ File = $it.File; Status = $it.Status; Type = $it.Type }
+          }
+
+          # Emit the inferred edge list to the GitHub Step Summary as a
+          # Mermaid graph for reviewer visibility — only when at least one
+          # edge exists (otherwise the graph is empty and adds noise).
+          $totalEdges = 0
+          foreach ($s in $deps.Values) { $totalEdges += $s.Count }
+          if ($totalEdges -gt 0 -and $env:GITHUB_STEP_SUMMARY) {
+              $mermaid = New-Object System.Text.StringBuilder
+              [void]$mermaid.AppendLine('## R__ migration object ordering')
+              [void]$mermaid.AppendLine('')
+              [void]$mermaid.AppendLine('```mermaid')
+              [void]$mermaid.AppendLine('graph TD')
+              foreach ($id in $deps.Keys) {
+                  foreach ($d in $deps[$id]) {
+                      [void]$mermaid.AppendLine("  $($id.Replace('.','_').Replace('#','_')) --> $($d.Replace('.','_').Replace('#','_'))")
+                  }
+              }
+              [void]$mermaid.AppendLine('```')
+              [void]$mermaid.AppendLine('')
+              [void]$mermaid.AppendLine('Emit order (top → bottom):')
+              foreach ($id in $sortedIds) { [void]$mermaid.AppendLine("- $id") }
+              [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $mermaid.ToString(), [System.Text.UTF8Encoding]::new($false))
+          }
+
+          Write-Host "Dependency-aware emission order:"
+          foreach ($id in $sortedIds) { Write-Host "  $($id) [tier $($idToItem[$id].Tier)]" }
+
+          $allParts = @()
+          $schemaGrantBatches = @()
+          $objectsBuilt = 0
+
+          # Emit DROP statements FIRST so any subsequent CREATE OR ALTER for a
+          # surviving object cannot trip over a half-dropped dependent. Sort by
+          # (Schema, Name) for stable diff output across runs. The exception: an
+          # object that something in this R__ referenced at the merge base is
+          # dropped after it (a schema-bound view stops using a deleted function:
+          # the drop fails until the view is redefined), unless the R__ re-creates
+          # the same name (moved, or changed type), which needs the drop first.
+          $recreated = New-Object 'System.Collections.Generic.HashSet[string]'
+          foreach ($it in $items) {
+              if ($it.Type -ne 'Permissions') { [void]$recreated.Add($it.Id) }
+              elseif ($it.File -match '[/\\]Tables[/\\]') { foreach ($tr in @(Get-TableTriggers $it.Raw $it.Schema)) { [void]$recreated.Add($tr.Key) } }
+          }
+          $lateDrops = @()
+          if ($mergeBase -and $deletedRepeatableObjects.Count -gt 0) {
+            $baseRefs = @{}
+            foreach ($it in $items) {
+              if ($it.Status -ne 'M') { continue }
+              $baseRefs[$it.Node] = @(Get-SqlReferences (Get-CodeView ((git cat-file -p "${mergeBase}:$($it.File)" 2>$null) -join "`n")) $env:DATABASE | ForEach-Object { $_.Key })
+            }
+            $global:LASTEXITCODE = 0
+            foreach ($d in $deletedRepeatableObjects) {
+              $dk = "$($d.Schema).$($d.Name)".ToLowerInvariant()
+              if ($recreated.Contains($dk)) { continue }
+              $users = @($baseRefs.Keys | Where-Object { $baseRefs[$_] -contains $dk })
+              if ($users.Count) { $lateDrops += $d; Write-Host "  DROP $($d.SqlType) [$($d.Schema)].[$($d.Name)] goes after $($users -join ', '), which used it" }
+            }
+          }
+          $earlyDrops = @($deletedRepeatableObjects | Where-Object { $lateDrops -notcontains $_ })
+          if ($earlyDrops.Count -gt 0) {
+            Write-Host "Emitting $($earlyDrops.Count) DROP IF EXISTS statement(s) for deleted repeatable objects:`n"
+            $sortedDeletes = $earlyDrops | Sort-Object -Property Schema, Name
+            foreach ($d in $sortedDeletes) {
+              Write-Host "  DROP $($d.SqlType) [$($d.Schema)].[$($d.Name)] (was $($d.File))"
+              $dropBlock = "-- Drop $($d.Schema).$($d.Name)`r`nDROP $($d.SqlType) IF EXISTS [$($d.Schema)].[$($d.Name)];`r`nGO"
+              $allParts += $dropBlock
+              $objectsBuilt++
+            }
+            Write-Host ""
+          }
+
+          foreach ($fileInfo in $orderedRepeatableFiles) {
+            $sourceFile = $fileInfo.File
+            $fullPath = Resolve-Path $sourceFile -ErrorAction SilentlyContinue
+            if (-not $fullPath) {
+              Write-Host "  WARNING: Cannot resolve path: $sourceFile"
+              continue
+            }
+
+            Write-Host "  Reading: $sourceFile"
+
+            # Use .NET File.ReadAllText for reliable full-file reads (avoids PowerShell pipeline truncation)
+            $sourceContent = [System.IO.File]::ReadAllText($fullPath.Path)
+            $sourceLength = $sourceContent.Length
+            Write-Host "    Source size: $sourceLength chars"
+
+            if ([string]::IsNullOrWhiteSpace($sourceContent)) {
+              Write-Host "    WARNING: Empty source file, skipping"
+              continue
+            }
+
+            if ($fileInfo.Type -eq "Permissions") {
+              # Table/synonym/security/UDT files: the object itself belongs in V__,
+              # so keep only the repeatable batches, in file order - GRANT/REVOKE/DENY,
+              # and the triggers a table file defines (see Get-BatchTrigger).
+              $fileSchema = if ($sourceFile -match "([^/\\]+)[/\\]Tables[/\\]") { $matches[1] } else { $null }
+              $batches = $sourceContent -split '(?m)^\s*GO\s*$'
+              $keptBatches = @()
+              $triggerCount = 0
+              foreach ($batch in $batches) {
+                $trimmed = $batch.Trim()
+                if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+                $trigger = if ($fileSchema) { Get-BatchTrigger $trimmed $fileSchema } else { $null }
+                if ($trigger) {
+                  $keptBatches += $trigger.Batch
+                  $triggerCount++
+                  Write-Host "    Trigger: [$($trigger.Schema)].[$($trigger.Name)] (CREATE OR ALTER)"
+                  continue
+                }
+                $batchHasPermission = $trimmed -match '(?i)(GRANT|REVOKE|DENY)\s+'
+                $batchLines = $trimmed -split "`n" | Where-Object { $_.Trim() -notmatch '(?i)^\s*(GRANT|REVOKE|DENY)\s+' -and $_.Trim() -notmatch '^\s*--' -and $_.Trim() -ne '' }
+                $batchHasStructure = ($batchLines -join "`n") -match '(?i)(CREATE|ALTER|DROP)\s+'
+                if ($batchHasPermission -and -not $batchHasStructure) {
+                  # Schema-level grants (ON SCHEMA::) are routed to the versioned
+                  # migration; only object-level grants belong in the repeatable.
+                  if ($trimmed -match '(?i)\bON\s+SCHEMA::') {
+                    $schemaGrantBatches += $trimmed
+                  } else {
+                    $keptBatches += $trimmed
+                  }
+                }
+              }
+              if ($keptBatches.Count -gt 0) {
+                $migratedContent = ($keptBatches -join "`nGO`n`n")
+                $trimmedEnd = $migratedContent.TrimEnd()
+                if (-not $trimmedEnd.EndsWith("GO")) {
+                  $migratedContent = $trimmedEnd + "`nGO"
+                } else {
+                  $migratedContent = $trimmedEnd
+                }
+                $allParts += $migratedContent
+                $objectsBuilt++
+                Write-Host "    OK: Extracted $($keptBatches.Count - $triggerCount) permission batch(es) and $triggerCount trigger(s) ($($migratedContent.Length) chars)"
+              } else {
+                Write-Host "    SKIP: No standalone permission batches or triggers found"
+              }
+            } else {
+              # Views/SPs/Functions/Triggers: Convert CREATE to CREATE OR ALTER
+              # (CREATE PROC included: left as is, it fails on an existing object)
+              $migratedContent = $sourceContent -replace '(?i)\bCREATE\s+(VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\b', 'CREATE OR ALTER $1'
+              $migratedContent = $migratedContent.TrimStart()
+
+              # Ensure ends with GO
+              $trimmedEnd = $migratedContent.TrimEnd()
+              if (-not $trimmedEnd.EndsWith("GO")) {
+                $migratedContent = $trimmedEnd + "`nGO"
+              } else {
+                $migratedContent = $trimmedEnd
+              }
+
+              # Verify GRANT statements are preserved
+              $sourceGrants = [regex]::Matches($sourceContent, '(?i)GRANT\s+(SELECT|EXECUTE|EXEC)\b').Count
+              $migratedGrants = [regex]::Matches($migratedContent, '(?i)GRANT\s+(SELECT|EXECUTE|EXEC)\b').Count
+              Write-Host "    GRANT statements: source=$sourceGrants, migrated=$migratedGrants"
+              if ($sourceGrants -ne $migratedGrants) {
+                Write-Host "    ::warning::GRANT count mismatch! Source has $sourceGrants but migrated has $migratedGrants"
+              }
+
+              $allParts += $migratedContent
+              $objectsBuilt++
+              Write-Host "    OK: CREATE OR ALTER (from source, $($migratedContent.Length) chars)"
+            }
+          }
+          foreach ($d in $lateDrops) {
+            $allParts += "-- Drop $($d.Schema).$($d.Name) (after what used it)`r`nDROP $($d.SqlType) IF EXISTS [$($d.Schema)].[$($d.Name)];`r`nGO"
+            $objectsBuilt++
+          }
+
+          # Schema-level grants (ON SCHEMA::) collected from Security files belong
+          # in the VERSIONED migration, not the repeatable. Route them there
+          # deterministically (never dropped); object-level grants stay in R.
+          if ($schemaGrantBatches.Count -gt 0 -and (Test-Path "migration_scripts.json")) {
+            $msTmp = Get-Content "migration_scripts.json" -Raw | ConvertFrom-Json
+            if ($msTmp.versionMigration -and -not [string]::IsNullOrWhiteSpace($msTmp.versionMigration.content)) {
+              $vc = $msTmp.versionMigration.content
+              $injected = 0
+              foreach ($sg in ($schemaGrantBatches | Select-Object -Unique)) {
+                if (-not $vc.Contains($sg)) { $vc = $vc.TrimEnd() + "`r`n`r`n" + $sg + "`r`nGO"; $injected++ }
+              }
+              $msTmp.versionMigration.content = $vc
+              $msTmp | ConvertTo-Json -Depth 10 | Out-File "migration_scripts.json" -Encoding UTF8
+              Write-Host "Routed $injected schema-level grant batch(es) to the versioned migration"
+            } else {
+              Write-Host "::warning::Schema-level grants found but no versioned migration; keeping them in the repeatable"
+              $allParts += (($schemaGrantBatches | Select-Object -Unique) -join "`r`nGO`r`n`r`n") + "`r`nGO"
+            }
+          }
+
+          if ($objectsBuilt -eq 0) {
+            Write-Host "No objects built, keeping Claude output"
+            exit 0
+          }
+
+          # Join all parts and write DIRECTLY to disk (bypasses JSON serialization issues).
+          # Use a blank-line separator ("`r`n`r`n") so even if a batch's trailing newline
+          # gets trimmed upstream, the next batch's header still starts on a fresh line —
+          # this prevents `GO-- next-batch-header` from ever sharing a line.
+          $builtContent = ($allParts -join "`r`n`r`n").TrimEnd()
+
+          # Self-check: every batch of the R__ must be safe to run again - a CREATE
+          # OR ALTER, a DROP ... IF EXISTS, a GRANT/REVOKE/DENY or a SET option.
+          # Anything else (a plain CREATE, a structure statement) fails on an
+          # existing object or belongs in the V__: stop rather than write it.
+          $notRerunnable = @()
+          foreach ($b in ($builtContent -split '(?m)^\s*GO\s*$')) {
+            $code = [regex]::Replace($b.Trim(), '\A(?:\s|--[^\n]*|/\*.*?\*/)*', '', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            if ($code -and $code -notmatch '(?i)\A(CREATE\s+OR\s+ALTER\s+(VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\b|DROP\s+(VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\s+IF\s+EXISTS\b|GRANT\b|REVOKE\b|DENY\b|SET\s+\w+\s+(ON|OFF)\b)') {
+              $notRerunnable += ($code -split "`n")[0].Trim()
+            }
+          }
+          if ($notRerunnable.Count -gt 0) {
+            Write-Host "::error::The repeatable migration has $($notRerunnable.Count) batch(es) that cannot be re-run - not writing it:"
+            $notRerunnable | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+
+          if (-not (Test-Path "Migration")) {
+            New-Item -ItemType Directory -Path "Migration" | Out-Null
+          }
+
+          $migrationFilePath = "Migration\$filename"
+          [System.IO.File]::WriteAllText($migrationFilePath, $builtContent, [System.Text.UTF8Encoding]::new($false))
+
+          $writtenLength = (Get-Item $migrationFilePath).Length
+          Write-Host "`nWrote migration file directly to disk: $migrationFilePath ($writtenLength bytes)"
+
+          # Verify GRANT statements survived in the written file
+          $writtenContent = [System.IO.File]::ReadAllText($migrationFilePath)
+          $writtenGrants = [regex]::Matches($writtenContent, '(?i)GRANT\s+(SELECT|EXECUTE|EXEC)\b').Count
+          Write-Host "GRANT statements in written file: $writtenGrants"
+
+          # Also update migration_scripts.json for downstream steps (validate, PR comment)
+          if (Test-Path "migration_scripts.json") {
+            $migrationScripts = Get-Content "migration_scripts.json" -Raw | ConvertFrom-Json
+          } else {
+            $migrationScripts = @{
+              repeatableMigration = $null
+              versionMigration = $null
+              summary = "Migration scripts generated"
+            }
+          }
+          $migrationScripts.repeatableMigration = @{
+            filename = $filename
+            content = $builtContent
+          }
+          $migrationScripts | ConvertTo-Json -Depth 10 | Out-File "migration_scripts.json" -Encoding UTF8
+
+          Write-Host "`nObjects built from source: $objectsBuilt / $($repeatableFiles.Count)"
+          Write-Host "Status: WRITTEN DIRECTLY TO DISK (deterministic)"
+          echo "REPEATABLE_BUILT_FROM_SOURCE=true" >> $env:GITHUB_ENV
+
+      - name: Write migration scripts to files
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: | 
+          Write-Host "Writing migration scripts to files..."
+      
+          if (-not (Test-Path "Migration")) {
+            New-Item -ItemType Directory -Path "Migration" | Out-Null
+            Write-Host "Created Migration folder"
+          }
+      
+          if (-not (Test-Path "migration_scripts.json")) {
+            Write-Host "::error::migration_scripts.json not found"
+            exit 1
+          }
+      
+          $migrationScripts = Get-Content "migration_scripts.json" -Raw | ConvertFrom-Json
+
+          $filesCreated = 0
+          $createdFiles = @()
+
+          if ($migrationScripts.repeatableMigration) {
+            $filename = $migrationScripts.repeatableMigration.filename
+            $filepath = "Migration\$filename"
+
+            # Skip writing if already built directly from source files (avoids JSON round-trip issues)
+            if ($env:REPEATABLE_BUILT_FROM_SOURCE -eq 'true' -and (Test-Path $filepath)) {
+              Write-Host "✓ Repeatable migration already written from source: $filepath"
+            } else {
+              $content = $migrationScripts.repeatableMigration.content
+              Set-Content -Path $filepath -Value $content -Encoding UTF8 -NoNewline
+              Write-Host "✓ Created: $filepath"
+            }
+            $createdFiles += $filename
+            $filesCreated++
+          }
+
+          if ($migrationScripts.versionMigration) {
+            $filename = $migrationScripts.versionMigration.filename
+            $content = $migrationScripts.versionMigration.content
+
+            # Post-processing: Remove object-level permission batches from version migration
+            # Object-level GRANTs/REVOKEs/DENYs (... ON OBJECT::) belong in repeatable migrations (R__)
+            # Only schema-level GRANTs (... ON SCHEMA::) should remain in version migrations
+            $batches = $content -split '(?m)^\s*GO\s*$'
+            $keptBatches = @()
+            $removedCount = 0
+
+            foreach ($batch in $batches) {
+              $trimmed = $batch.Trim()
+              if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+
+              # Strip comment lines to inspect actual SQL
+              $sqlLines = $trimmed -split "`n" | Where-Object { $_.Trim() -and $_.Trim() -notmatch '^\s*--' }
+              $sqlOnly = ($sqlLines -join "`n").Trim()
+
+              # Check if batch contains object-level permission statements
+              $hasObjectPermission = $sqlOnly -match '(?i)(GRANT|REVOKE|DENY)\s+\w+\s+ON\s+OBJECT::'
+
+              # Strip permission lines, then check if any structural DDL/DML remains
+              # This avoids false positives from keywords inside GRANT (e.g., GRANT UPDATE ON OBJECT::)
+              $withoutPermissions = ($sqlLines | Where-Object { $_.Trim() -notmatch '(?i)^\s*(GRANT|REVOKE|DENY)\s+' }) -join "`n"
+              $hasStructuralContent = $withoutPermissions -match '(?i)(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|EXEC|TRUNCATE)\s+'
+
+              if ($hasObjectPermission -and -not $hasStructuralContent) {
+                $removedCount++
+              } else {
+                $keptBatches += $trimmed
+              }
+            }
+
+            if ($removedCount -gt 0) {
+              Write-Host "  Removed $removedCount object-level GRANT batch(es) from version migration (belong in repeatable)"
+
+              # Check if version migration is now effectively empty
+              $hasSubstantive = $false
+              foreach ($b in $keptBatches) {
+                $nonComment = ($b -split "`n" | Where-Object { $_.Trim() -and $_.Trim() -notmatch '^\s*--' }) -join ""
+                if (-not [string]::IsNullOrWhiteSpace($nonComment)) { $hasSubstantive = $true; break }
+              }
+
+              if (-not $hasSubstantive) {
+                Write-Host "  Version migration now empty after removing object-level GRANTs - skipping file creation"
+                $migrationScripts.versionMigration = $null
+              } else {
+                $content = ($keptBatches -join "`nGO`n`n") + "`nGO"
+              }
+            }
+
+            # Continue only if version migration still has content
+            if ($migrationScripts.versionMigration) {
+              # Post-processing: Replace AppDb_MSG with AppCatalog in synonym FOR clauses
+              # AppDb_MSG is the SSDT variable name but AppCatalog is the actual database name
+              $synonymMappings = @{
+                'AppDb_MSG' = 'AppCatalog'
+              }
+
+              foreach ($varName in $synonymMappings.Keys) {
+                $actualDbName = $synonymMappings[$varName]
+                # Match synonym FOR clauses: FOR AppDb_MSG.schema.object or FOR [AppDb_MSG].schema.object
+                $beforeReplace = $content
+                $content = $content -replace "(?i)FOR\s+\[?${varName}\]?\.", "FOR ${actualDbName}."
+                if ($content -ne $beforeReplace) {
+                  Write-Host "  Auto-replaced synonym target: ${varName} -> ${actualDbName}"
+                }
+              }
+
+              $migrationScripts.versionMigration.content = $content
+              $filepath = "Migration\$filename"
+
+              Set-Content -Path $filepath -Value $content -Encoding UTF8 -NoNewline
+              Write-Host "✓ Created: $filepath"
+              $createdFiles += $filename
+              $filesCreated++
+            }
+          }
+
+          if ($filesCreated -eq 0) {
+            Write-Host "::warning::No migration files were created"
+            exit 1
+          } else {
+            Write-Host "`nSuccessfully created $filesCreated migration file(s)"
+
+            # Re-save migration_scripts.json with post-processed content (e.g., AppDb_MSG -> AppCatalog)
+            $migrationScripts | ConvertTo-Json -Depth 10 | Out-File "migration_scripts.json" -Encoding UTF8
+          }
+
+      - name: Claude migration review (syntax + security)
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          Write-Host "========================================="
+          Write-Host "CLAUDE MIGRATION REVIEW (syntax + security)"
+          Write-Host "========================================="
+          Write-Host "T-SQL parse/compile + permission audit on the final on-disk migration artifacts."
+
+          $database = $env:DATABASE
+          $branch = $env:BRANCH_SLUG
+
+          if ([string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)) {
+            Write-Host "::error::ANTHROPIC_API_KEY not configured - cannot run migration review (failing closed)"
+            exit 1
+          }
+          if (-not (Test-Path "Migration")) { Write-Host "No Migration folder - nothing to review"; exit 0 }
+
+          # ---- Collect THIS branch's final migration artifacts (glob, not regex) ----
+          $pattern = "*.$database.$branch.sql"
+          $migrationFiles = @(Get-ChildItem -Path "Migration" -Filter $pattern -File -ErrorAction SilentlyContinue)
+          if ($migrationFiles.Count -eq 0) { Write-Host "No artifacts matched '$pattern' - nothing to review"; exit 0 }
+          Write-Host "Reviewing $($migrationFiles.Count) migration file(s):"
+          $migrationFiles | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+          # ---- Known-roles source: all role_*.sql under the Security folder (let Claude parse it; no regex here) ----
+          $rolesSource = ""
+          $secDirs = @("$database/Security", "$database/Security/Roles") | Where-Object { Test-Path $_ }
+          $roleFiles = @($secDirs | ForEach-Object { Get-ChildItem -Path $_ -Filter "role_*.sql" -File -ErrorAction SilentlyContinue })
+          foreach ($rf in $roleFiles) {
+            $rolesSource += "-- FILE: $($rf.Name)`n" + [System.IO.File]::ReadAllText($rf.FullName) + "`n"
+          }
+
+          # ---- Build the migration-file payload ----
+          $filesSb = New-Object System.Text.StringBuilder
+          foreach ($mf in $migrationFiles) {
+            [void]$filesSb.AppendLine("<FILE name=`"$($mf.Name)`">")
+            [void]$filesSb.AppendLine([System.IO.File]::ReadAllText($mf.FullName))
+            [void]$filesSb.AppendLine("</FILE>")
+          }
+
+          # ---- Object catalogue: every object DEFINED in the source tree, by its true
+          # ---- CREATE identity (robust to flat OR Tables/Views/... folder layouts). This
+          # ---- is what lets the review catch a migration that references a non-existent
+          # ---- object (e.g. a typo like fin.SkuList_STG that exists in neither repo nor prod).
+          $excludeDirs = @('bin','obj','Scripts','Storage','external-refs','Properties','.vs','Migration','Archive','deploy','Security')
+          $knownSchemas = [System.Collections.Generic.List[string]]::new()
+          $knownSchemas.Add('dbo'); $knownSchemas.Add('sys')
+          $knownObjects = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+          if (Test-Path $database) {
+            Get-ChildItem -Path $database -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $excludeDirs -notcontains $_.Name } |
+              ForEach-Object { $knownSchemas.Add($_.Name) }
+            $createRe = [regex]'(?im)^\s*CREATE\s+(?:OR\s+ALTER\s+)?(?:TABLE|VIEW|PROC(?:EDURE)?|FUNCTION|TRIGGER|SYNONYM|TYPE)\s+\[?(\w+)\]?\.\[?(\w+)\]?'
+            $srcFiles = @(Get-ChildItem -Path $database -Recurse -Filter *.sql -File -ErrorAction SilentlyContinue |
+                          Where-Object { $rel = $_.FullName; -not @($excludeDirs | Where-Object { $rel -match "[\\/]$([regex]::Escape($_))[\\/]" }).Count })
+            foreach ($sf in $srcFiles) {
+              $txt = [System.IO.File]::ReadAllText($sf.FullName)
+              foreach ($m in $createRe.Matches($txt)) {
+                [void]$knownObjects.Add($m.Groups[1].Value + '.' + $m.Groups[2].Value)
+              }
+            }
+          }
+          $knownSchemasList = (($knownSchemas | Select-Object -Unique | Sort-Object) -join ', ')
+          $knownObjectsList = ((@($knownObjects) | Sort-Object) -join "`n")
+          Write-Host "Object catalogue: $(@($knownObjects).Count) object(s) across $(@($knownSchemas | Select-Object -Unique).Count) schema(s)"
+
+          $skillPrompt = Get-Content ".claude/skills/sql-migration-generator/references/migration-review.md" -Raw
+          $ctxLines = @(
+            "",
+            "DATABASE: $database",
+            "",
+            "KNOWN_ROLES_SOURCE:",
+            $rolesSource,
+            "",
+            "KNOWN_SCHEMAS: $knownSchemasList",
+            "",
+            "KNOWN_OBJECTS:",
+            $knownObjectsList,
+            "",
+            "MIGRATION FILES TO REVIEW:",
+            $filesSb.ToString()
+          )
+          $prompt = $skillPrompt + "`n" + ($ctxLines -join "`n")
+
+          $apiBody = @{ model = "claude-opus-4-8"; max_tokens = 24000; messages = @(@{ role = "user"; content = $prompt }) } | ConvertTo-Json -Depth 10
+          $bodyFile = Join-Path $env:RUNNER_TEMP "review_body.json"
+          [System.IO.File]::WriteAllText($bodyFile, $apiBody, (New-Object System.Text.UTF8Encoding $false))
+          $responseFile = Join-Path $env:RUNNER_TEMP "review_response.json"
+
+          $claudeText = $null
+          $delay = 10
+          for ($attempt = 1; $attempt -le 3 -and -not $claudeText; $attempt++) {
+            if ($attempt -gt 1) { Write-Host "Retry $attempt/3 after $delay s..."; Start-Sleep -Seconds $delay; $delay *= 2 }
+            if (Test-Path $responseFile) { Remove-Item $responseFile -Force }
+            curl.exe --silent --show-error --output "$responseFile" --request POST `
+              --url "https://api.anthropic.com/v1/messages" `
+              --header "x-api-key: $($env:ANTHROPIC_API_KEY)" --header "anthropic-version: 2023-06-01" `
+              --header "content-type: application/json" --data-binary "@$bodyFile" `
+              --max-time 600 --tlsv1.2 --connect-timeout 30
+            if ($LASTEXITCODE -ne 0) { Write-Host "::warning::curl failed (exit $LASTEXITCODE) attempt $attempt"; continue }
+            if (-not (Test-Path $responseFile) -or (Get-Item $responseFile).Length -eq 0) { continue }
+            $resp = [System.IO.File]::ReadAllText($responseFile, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ($resp.type -eq "error") { Write-Host "::warning::API error attempt ${attempt}: $($resp.error.message)"; continue }
+            # The text block by type, not by position: a model that thinks first returns a
+            # thinking block at content[0], whose .text is $null.
+            $textBlock = @($resp.content | Where-Object { $_.type -eq 'text' }) | Select-Object -First 1
+            if (-not $textBlock) {
+              Write-Host "::error::Migration review: Claude's response has no text block (content: $((@($resp.content) | ForEach-Object { $_.type }) -join ', '); stop_reason=$($resp.stop_reason)) - failing closed"
+              exit 1
+            }
+            $claudeText = [string]$textBlock.text
+          }
+          Remove-Item $bodyFile, $responseFile -Force -ErrorAction SilentlyContinue
+
+          if (-not $claudeText) { Write-Host "::error::Migration review could not reach Claude after 3 attempts - failing closed"; exit 1 }
+
+          $open = $claudeText.IndexOf("<REVIEW>"); $close = $claudeText.IndexOf("</REVIEW>")
+          if ($open -lt 0 -or $close -le $open) {
+            Write-Host "::error::Review response missing <REVIEW> envelope - failing closed"; Write-Host $claudeText; exit 1
+          }
+          $json = $claudeText.Substring($open + 8, $close - ($open + 8)).Replace('```json','').Replace('```','').Trim()
+          try { $review = $json | ConvertFrom-Json } catch { Write-Host "::error::Review returned unparseable JSON - failing closed"; Write-Host $json; exit 1 }
+
+          # ---- Map to the JSON contracts the PR-comment step already consumes ----
+          $toStr = { param($x) if ($x -is [string]) { $x } else { (($x.PSObject.Properties | ForEach-Object { "$($_.Name): $($_.Value)" }) -join '; ') } }
+
+          $synErrors = @()
+          foreach ($e in @($review.syntax.errors)) {
+            $b = if ($null -ne $e.batch) { "batch $($e.batch), " } else { "" }
+            $l = if ($null -ne $e.line) { "line $($e.line)" } else { "line ?" }
+            $synErrors += "[X] $($e.file) (${b}${l}): $($e.message) -- fix: $($e.fix)"
+          }
+          $synWarnings = @()
+          foreach ($w in @($review.syntax.warnings)) { $synWarnings += "[!] $($w.file): $($w.message)" }
+          $syntaxPassed = ($review.syntax.status -eq "PASS") -and ($synErrors.Count -eq 0)
+
+          # ---- Part 3: referenced-object existence (missing objects are BLOCKING) ----
+          # The model's "missing" verdict is re-checked against $knownObjects (case-insensitive)
+          # before it can block: the model intermittently reports catalogued objects as missing
+          # (a case-only difference, or even an exact match), so those are demoted to
+          # warnings. Anything not in the catalogue still blocks.
+          $confirmedMissing = @()
+          $objWarnings = @()
+          foreach ($mo in @($review.objects.missing)) {
+            $name = "$($mo.object)".Replace('[','').Replace(']','').Trim()
+            if ($knownObjects.Contains($name)) {
+              Write-Host "::warning::Migration review reported '$($mo.object)' as missing, but it is in the source catalogue - ignored"
+              $objWarnings += "[!] $($mo.file): '$($mo.object)' reported missing by the review but is in the source catalogue - ignored"
+            } else {
+              $confirmedMissing += $mo
+            }
+          }
+          $objMissing = @()
+          foreach ($mo in $confirmedMissing) {
+            $loc = if ($mo.referencedAt) { " [$($mo.referencedAt)]" } else { "" }
+            $msg = if ($mo.message) { " -- $($mo.message)" } else { "" }
+            $objMissing += "[X] $($mo.file): references non-existent object '$($mo.object)'$loc$msg"
+          }
+          foreach ($ow in @($review.objects.warnings)) { $objWarnings += "[!] " + (& $toStr $ow) }
+          # A FAIL status is only overridden when every reported entry was a catalogued object;
+          # FAIL with nothing listed still fails closed.
+          $objStatusFailed = ($review.objects.status -eq "FAIL") -and (@($review.objects.missing).Count -eq 0)
+          $objectsPassed = (-not $objStatusFailed) -and ($objMissing.Count -eq 0)
+
+          # ---- Combined build-gate contract: syntax AND object-existence both block ----
+          $allErrors   = @($synErrors)   + @($objMissing)
+          $allWarnings = @($synWarnings) + @($objWarnings)
+          $validationPassed = $syntaxPassed -and $objectsPassed
+
+          @{ errors = $allErrors; warnings = $allWarnings; passed = $validationPassed } |
+            ConvertTo-Json -Depth 5 | Out-File "validation_results.json" -Encoding UTF8
+
+          $secIssues = @(@($review.security.issues) | ForEach-Object { & $toStr $_ })
+          $secWarns  = @(@($review.security.warnings) | ForEach-Object { & $toStr $_ })
+
+          @{ statements = @($review.security.statements); issues = $secIssues;
+             warnings = $secWarns; passed = [bool]$review.security.passed } |
+            ConvertTo-Json -Depth 5 | Out-File "security_audit.json" -Encoding UTF8
+
+          # ---- Step summary ----
+          $sb = New-Object System.Text.StringBuilder
+          [void]$sb.AppendLine("## Claude migration review")
+          [void]$sb.AppendLine("")
+          if ($syntaxPassed) { [void]$sb.AppendLine(":white_check_mark: **Syntax:** all batches parse cleanly.") }
+          else {
+            [void]$sb.AppendLine(":x: **Syntax: BLOCKED** - $($synErrors.Count) parse/compile error(s).")
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("| File | Batch | Line | Error | Fix |")
+            [void]$sb.AppendLine("| ---- | ----- | ---- | ----- | --- |")
+            foreach ($e in @($review.syntax.errors)) {
+              $b = if ($null -ne $e.batch) { $e.batch } else { "-" }
+              $l = if ($null -ne $e.line) { $e.line } else { "-" }
+              [void]$sb.AppendLine("| $($e.file) | $b | $l | $("$($e.message)".Replace('|','\|')) | $("$($e.fix)".Replace('|','\|')) |")
+            }
+          }
+          [void]$sb.AppendLine("")
+          if ($objMissing.Count -eq 0) { [void]$sb.AppendLine(":white_check_mark: **Object references:** all schema-qualified objects resolve against the source catalogue.") }
+          else {
+            [void]$sb.AppendLine(":x: **Object references: BLOCKED** - $($objMissing.Count) reference(s) to object(s) that exist in neither the repo nor this migration.")
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("| File | Missing object | Referenced at | Detail |")
+            [void]$sb.AppendLine("| ---- | -------------- | ------------- | ------ |")
+            foreach ($mo in @($review.objects.missing)) {
+              [void]$sb.AppendLine("| $($mo.file) | $($mo.object) | $("$($mo.referencedAt)".Replace('|','\|')) | $("$($mo.message)".Replace('|','\|')) |")
+            }
+          }
+          [void]$sb.AppendLine("")
+          # $secIssues / $secWarns already coerced to strings above
+          if ($review.security.passed -and $secWarns.Count -eq 0) { [void]$sb.AppendLine(":white_check_mark: **Security:** $(@($review.security.statements).Count) grant statement(s), no issues.") }
+          else {
+            if ($secIssues.Count -gt 0) { [void]$sb.AppendLine(":x: **Security issues:** $($secIssues.Count)"); foreach ($i in $secIssues) { [void]$sb.AppendLine("- $i") } }
+            if ($secWarns.Count -gt 0) { [void]$sb.AppendLine(":warning: **Security warnings:** $($secWarns.Count)"); foreach ($w in $secWarns) { [void]$sb.AppendLine("- $w") } }
+          }
+          if ($env:GITHUB_STEP_SUMMARY) { [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $sb.ToString(), [System.Text.UTF8Encoding]::new($false)) }
+
+          # ---- Console + gate ----
+          foreach ($i in $secIssues) { Write-Host "::warning::SECURITY: $i" }
+          foreach ($w in $secWarns) { Write-Host "  security warning: $w" }
+
+          $gateFailed = $false
+          if (-not $syntaxPassed) {
+            Write-Host "::error::Migration review FAILED - $($synErrors.Count) T-SQL syntax/compile error(s):"
+            $synErrors | ForEach-Object { Write-Host "  $_" }
+            $gateFailed = $true
+          }
+          if (-not $objectsPassed) {
+            Write-Host "::error::Migration review FAILED - $($objMissing.Count) reference(s) to object(s) that exist in neither the repo nor this migration (typo or object never added to source control):"
+            $objMissing | ForEach-Object { Write-Host "  $_" }
+            $gateFailed = $true
+          }
+          if ($gateFailed) { exit 1 }
+          Write-Host "Migration review passed - no syntax errors, all object references resolve. Security: $(@($review.security.statements).Count) statement(s), $($secIssues.Count) issue(s), $($secWarns.Count) warning(s)."
+
+      - name: Check object order in the migration scripts
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          # Flyway runs the V__ and then the R__, each batch by batch top to
+          # bottom, so every object must be created before anything that needs it
+          # and nothing may be used after a drop. This checks both final scripts
+          # deterministically, however they were produced, adds what it finds to
+          # validation_results.json for the PR comment, and fails the job before
+          # an out-of-order script is committed.
+          if (-not (Test-Path "migration_scripts.json")) { Write-Host "No migration_scripts.json - nothing to check"; exit 0 }
+          $ms = Get-Content "migration_scripts.json" -Raw | ConvertFrom-Json
+          $vText = if ($ms.versionMigration) { [string]$ms.versionMigration.content } else { '' }
+          $rText = if ($ms.repeatableMigration) { [string]$ms.repeatableMigration.content } else { '' }
+          $vFile = if ($ms.versionMigration) { [string]$ms.versionMigration.filename } else { '' }
+          $rFile = if ($ms.repeatableMigration) { [string]$ms.repeatableMigration.filename } else { '' }
+          if (-not $vText -and -not $rText) { Write-Host "No migration content - nothing to check"; exit 0 }
+          $errors = New-Object System.Collections.Generic.List[string]
+          $warnings = New-Object System.Collections.Generic.List[string]
+          try {
+            # The same T-SQL reading as the R__ builder: Get-CodeView (comments and
+            # string literals masked, dynamic SQL kept), Get-SqlReferences, ...
+            . (Join-Path $env:GITHUB_WORKSPACE '.github/scripts/migration-objects.ps1')
+            function Get-LineOf([int[]]$nl, [int]$pos) { $lo = 0; $hi = $nl.Count; while ($lo -lt $hi) { $mid = ($lo + $hi) -shr 1; if ($nl[$mid] -lt $pos) { $lo = $mid + 1 } else { $hi = $mid } }; $lo + 1 }
+            $mergeBase = git merge-base "origin/$($env:BASE_BRANCH)" HEAD 2>$null
+            if ($LASTEXITCODE -ne 0) { $mergeBase = $null }
+            # Source now: each repeatable object and its file (built on first use).
+            $script:catalogue = $null
+            function Get-Catalogue {
+              if ($null -ne $script:catalogue) { return $script:catalogue }
+              $cat = @{}
+              $root = (Get-Location).ProviderPath.TrimEnd('\', '/')
+              foreach ($sf in @(Get-ChildItem -Path $env:DATABASE -Recurse -Filter *.sql -File -ErrorAction SilentlyContinue)) {
+                $rel = $sf.FullName.Substring($root.Length + 1).Replace('\', '/')
+                if ($rel -match '[/\\](Views|Stored Procedures?|Functions|Triggers)[/\\]') {
+                  $d = Get-DefinedObject ([System.IO.File]::ReadAllText($sf.FullName))
+                  if ($d) { $cat[$d.Key] = @{ File = $rel; Kind = $d.Kind } }
+                } elseif ($rel -match '([^/\\]+)[/\\]Tables[/\\]') {
+                  foreach ($tr in @(Get-TableTriggers ([System.IO.File]::ReadAllText($sf.FullName)) $matches[1])) { $cat[$tr.Key] = @{ File = $rel; Kind = 'TRIGGER' } }
+                }
+              }
+              $script:catalogue = $cat
+              return $cat
+            }
+            $statusOf = @{}
+            if (Test-Path "changed_files.txt") {
+              foreach ($line in ((Get-Content "changed_files.txt" -Raw) -split "`r?`n")) {
+                $parts = $line.Trim() -split "`t"
+                if ($parts.Count -ge 2) { $statusOf[$parts[-1].Trim()] = $parts[0].Trim().Substring(0, 1) }
+              }
+            }
+
+            # ---- R__: each batch re-runnable; views/functions after what they need
+            $rDefs = @{}; $rSegments = @(); $rDropList = @()
+            if ($rText) {
+              $rCode = Get-CodeView $rText
+              $rNl = @([regex]::Matches($rText, "`n") | ForEach-Object { $_.Index })
+              $cuts = @(0) + @([regex]::Matches($rCode, '(?m)^\s*GO\s*$') | ForEach-Object { $_.Index + $_.Length }) + @($rCode.Length)
+              for ($s = 0; $s -lt $cuts.Count - 1; $s++) {
+                $len = $cuts[$s + 1] - $cuts[$s]
+                $seg = $rCode.Substring($cuts[$s], $len) -replace '(?m)^\s*GO\s*$', ''
+                $lead = $seg.Length - $seg.TrimStart().Length
+                $code = $seg.Trim()
+                if (-not $code) { continue }
+                $at = $cuts[$s] + $lead
+                $line = Get-LineOf $rNl $at
+                if ($code -match '(?i)\ACREATE\s+OR\s+ALTER\s+(VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\b') {
+                  $d = Get-DefinedObject ($rText.Substring($cuts[$s], $len) -replace '(?m)^\s*GO\s*$', '')
+                  if (-not $rDefs.ContainsKey($d.Key)) { $rDefs[$d.Key] = @{ Kind = $d.Kind; Pos = $at; Line = $line } }
+                  $rSegments += @{ Key = $d.Key; Kind = $d.Kind; Pos = $at; Line = $line; Code = $code; SchemaBound = $d.SchemaBound }
+                } elseif ($code -match "(?i)\ADROP\s+(VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\s+IF\s+EXISTS\s+(?<name>$SqlDefName)" -or ($code -match "(?is)\AIF\b.*?\bDROP\s+(VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\s+(?:IF\s+EXISTS\s+)?(?<name>$SqlDefName)" -and $code -notmatch '(?i)\b(CREATE|ALTER|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|EXEC(UTE)?)\b')) {
+                  # DROP ... IF EXISTS, or the older guarded form IF EXISTS (...) DROP ...
+                  $key = (ConvertTo-SqlKey $matches['name']).Key
+                  if ($rDefs.ContainsKey($key)) { $errors.Add("$rFile line ${line}: drops $key, which the same script created at line $($rDefs[$key].Line)") }
+                  $rDropList += @{ Key = $key; Pos = $at; Line = $line }
+                } elseif ($code -notmatch '(?i)\A(GRANT|REVOKE|DENY)\b|\ASET\s+\w+\s+(ON|OFF)\b' -and -not ($code -match '(?is)\AIF\b.*\b(GRANT|REVOKE|DENY)\b' -and ([regex]::Replace($code, '(?is)\b(GRANT|REVOKE|DENY)\b.*?(?=;|\bEND\b|\z)', '')) -notmatch '(?i)\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|EXEC(UTE)?)\b')) {
+                  # (a guarded IF ... GRANT/REVOKE/DENY batch re-runs too)
+                  $errors.Add("$rFile line ${line}: '$((($code -split "`n")[0]).Trim())' cannot be re-run - a repeatable migration holds only CREATE OR ALTER, DROP ... IF EXISTS and GRANT/REVOKE/DENY")
+                }
+              }
+              foreach ($sg in $rSegments) {
+                foreach ($ref in @(Get-SqlReferences $sg.Code $env:DATABASE)) {
+                  if ($ref.Key -eq $sg.Key -or -not $rDefs.ContainsKey($ref.Key)) { continue }
+                  $dep = $rDefs[$ref.Key]
+                  if ((Test-SqlMustPrecede $sg.Kind $dep.Kind) -and $dep.Pos -gt $sg.Pos) {
+                    $errors.Add("$rFile line $($sg.Line): $($sg.Kind) $($sg.Key) needs $($dep.Kind) $($ref.Key), which is created later (line $($dep.Line))")
+                  }
+                }
+              }
+              # A drop before a schema-bound object that used the dropped one (at the
+              # merge base) fails: SQL Server refuses while the binding exists.
+              foreach ($dr in $rDropList) {
+                foreach ($sg in $rSegments) {
+                  if (-not $sg.SchemaBound -or $sg.Pos -lt $dr.Pos -or -not $mergeBase) { continue }
+                  $entry = (Get-Catalogue)[$sg.Key]
+                  if (-not $entry) { continue }
+                  $base = Get-CodeView ((git cat-file -p "${mergeBase}:$($entry.File)" 2>$null) -join "`n")
+                  if (@(Get-SqlReferences $base $env:DATABASE | Where-Object { $_.Key -eq $dr.Key }).Count) {
+                    $errors.Add("$rFile line $($dr.Line): drops $($dr.Key) before $($sg.Key) (line $($sg.Line)), which is schema-bound to it - the drop fails; it must come after")
+                  }
+                }
+              }
+            }
+
+            # ---- V__: created before use, not used after a drop, seeds before FKs
+            $vCreated = @{}; $vDropped = New-Object System.Collections.Generic.List[object]; $uses = @(); $vFlat = $null
+            if ($vText) {
+              $vCode = Get-CodeView $vText
+              $vNl = @([regex]::Matches($vText, "`n") | ForEach-Object { $_.Index })
+              $nameSpans = New-Object 'System.Collections.Generic.HashSet[int]'
+              $events = New-Object System.Collections.Generic.List[object]   # Pos, Key, Schema, Name, Act (create/drop), Kind
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bCREATE\s+(?<kind>TABLE|TYPE|SYNONYM|SEQUENCE)\s+(?<name>$SqlDefName)")) {
+                if ($m.Groups['name'].Value.StartsWith('#')) { continue }
+                $k = ConvertTo-SqlKey $m.Groups['name'].Value
+                $events.Add(@{ Pos = $m.Index; Key = $k.Key; Schema = $k.Schema; Name = $k.Name; Act = 'create'; Kind = $m.Groups['kind'].Value.ToUpperInvariant() }); [void]$nameSpans.Add($m.Groups['name'].Index)
+              }
+              $repeatableCreates = @()
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bCREATE\s+(?<alter>OR\s+ALTER\s+)?(?<kind>VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\s+(?<name>$SqlDefName)")) {
+                $kind = if ($m.Groups['kind'].Value -like 'PROC*') { 'PROCEDURE' } else { $m.Groups['kind'].Value.ToUpperInvariant() }
+                $k = ConvertTo-SqlKey $m.Groups['name'].Value
+                $events.Add(@{ Pos = $m.Index; Key = $k.Key; Schema = $k.Schema; Name = $k.Name; Act = 'create'; Kind = $kind }); [void]$nameSpans.Add($m.Groups['name'].Index)
+                $repeatableCreates += @{ Pos = $m.Index; Key = $k.Key; Kind = $kind; OrAlter = $m.Groups['alter'].Success }
+              }
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bDROP\s+(?<kind>TABLE|TYPE|SYNONYM|SEQUENCE|VIEW|PROCEDURE|PROC|FUNCTION|TRIGGER)\s+(?:IF\s+EXISTS\s+)?(?<names>$SqlDefName(?:\s*,\s*$SqlDefName)*)")) {
+                $kind = if ($m.Groups['kind'].Value -like 'PROC*') { 'PROCEDURE' } else { $m.Groups['kind'].Value.ToUpperInvariant() }
+                foreach ($nm in [regex]::Matches($m.Groups['names'].Value, $SqlDefName)) {
+                  $k = ConvertTo-SqlKey $nm.Value
+                  $events.Add(@{ Pos = $m.Index; Key = $k.Key; Schema = $k.Schema; Name = $k.Name; Act = 'drop'; Kind = $kind }); [void]$nameSpans.Add($m.Groups['names'].Index + $nm.Index)
+                }
+              }
+              # An object rename (sp_rename 'schema.old', 'new') drops the old name and
+              # creates the new one; renaming a column or an index changes neither.
+              $q = [char]39
+              foreach ($m in [regex]::Matches($vText, "(?i)\bsp_rename\s+(?:@objname\s*=\s*)?N?$q(?<old>[^$q]+)$q\s*,\s*(?:@newname\s*=\s*)?N?$q(?<new>[^$q]+)$q(?<rest>[^\r\n;]*)")) {
+                if ($m.Groups['rest'].Value -match "(?i)$q(COLUMN|INDEX|STATISTICS|USERDATATYPE)$q") { continue }
+                $old = ConvertTo-SqlKey $m.Groups['old'].Value
+                if (@(Split-SqlName $m.Groups['old'].Value).Count -gt 2) { continue }
+                $newName = @(Split-SqlName $m.Groups['new'].Value)[-1]
+                $events.Add(@{ Pos = $m.Index; Key = $old.Key; Schema = $old.Schema; Name = $old.Name; Act = 'drop'; Kind = 'RENAME' })
+                $events.Add(@{ Pos = $m.Index + 1; Key = "$($old.Schema).$newName".ToLowerInvariant(); Schema = $old.Schema; Name = $newName; Act = 'create'; Kind = 'RENAME' })
+              }
+              $schemaEvents = @{}; $roleEvents = @{}
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bCREATE\s+SCHEMA\s+(?<name>$SqlDefPart)")) { $k = (@(Split-SqlName $m.Groups['name'].Value)[0]).ToLowerInvariant(); if (-not $schemaEvents.ContainsKey($k)) { $schemaEvents[$k] = $m.Index } }
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bCREATE\s+ROLE\s+(?<name>$SqlDefPart)")) { $k = (@(Split-SqlName $m.Groups['name'].Value)[0]).ToLowerInvariant(); if (-not $roleEvents.ContainsKey($k)) { $roleEvents[$k] = $m.Index } }
+              $uses = @(Get-SqlReferences $vCode $env:DATABASE | ForEach-Object { @{ Pos = $_.Pos; Key = $_.Key; Named = $nameSpans.Contains($_.Pos) } })
+              $byKey = @{}
+              foreach ($e in ($events | Sort-Object { $_.Pos })) { if (-not $byKey.ContainsKey($e.Key)) { $byKey[$e.Key] = New-Object System.Collections.Generic.List[object] }; $byKey[$e.Key].Add($e) }
+              # A table/type/synonym/sequence existed before this script when a source file
+              # defines it and that file is not new in this PR: a use before its guarded
+              # (IF NOT EXISTS) CREATE then reads the existing object.
+              # (built on first use: only a use before a CREATE needs it)
+              $script:structure = $null
+              function Get-Structure {
+                if ($null -ne $script:structure) { return $script:structure }
+                $st = @{}
+                $root = (Get-Location).ProviderPath.TrimEnd('\', '/')
+                $createRx = "(?i)\bCREATE\s+(?:TABLE|TYPE|SYNONYM|SEQUENCE)\s+(?<n>$SqlDefName)"
+                foreach ($sf in @(Get-ChildItem -Path $env:DATABASE -Recurse -Filter *.sql -File -ErrorAction SilentlyContinue)) {
+                  $raw = [System.IO.File]::ReadAllText($sf.FullName)
+                  if ($raw -notmatch $createRx) { continue }
+                  foreach ($sm in [regex]::Matches((Get-CodeView $raw), $createRx)) {
+                    if ($sm.Groups['n'].Value.StartsWith('#')) { continue }
+                    $st[(ConvertTo-SqlKey $sm.Groups['n'].Value).Key] = $sf.FullName.Substring($root.Length + 1).Replace('\', '/')
+                  }
+                }
+                $script:structure = $st
+                return $st
+              }
+              function Test-ExistedBefore([string]$key) { $file = (Get-Structure)[$key]; if (-not $file) { $e = (Get-Catalogue)[$key]; if ($e) { $file = $e.File } }; [bool]$file -and $statusOf[$file] -ne 'A' }
+              function Test-DroppedBefore([string]$key, [int]$pos) { $byKey.ContainsKey($key) -and @($byKey[$key] | Where-Object { $_.Act -eq 'drop' -and $_.Pos -lt $pos }).Count -gt 0 }
+              # A view/procedure/function/trigger created with a plain CREATE fails if
+              # it already exists, unless this script dropped it first.
+              foreach ($rc in $repeatableCreates) {
+                $line = Get-LineOf $vNl $rc.Pos
+                $entry = (Get-Catalogue)[$rc.Key]
+                $existed = $entry -and ($statusOf[$entry.File] -ne 'A')
+                if (-not $rc.OrAlter -and $existed -and -not (Test-DroppedBefore $rc.Key $rc.Pos)) { $errors.Add("$vFile line ${line}: CREATE $($rc.Kind) $($rc.Key) fails - it already exists (it is in $($entry.File) before this PR); it belongs in the repeatable migration") }
+                else { $warnings.Add("$vFile line ${line}: $($rc.Kind) $($rc.Key) is created in the versioned migration - repeatable objects belong in the R__") }
+              }
+              foreach ($u in $uses) {
+                if ($u.Named -or -not $byKey.ContainsKey($u.Key)) { continue }
+                $evs = $byKey[$u.Key]
+                $last = $null; foreach ($e in $evs) { if ($e.Pos -lt $u.Pos) { $last = $e } }
+                $line = Get-LineOf $vNl $u.Pos
+                if ($null -eq $last) {
+                  if ($evs[0].Act -eq 'create' -and -not (Test-ExistedBefore $u.Key)) { $errors.Add("$vFile line ${line}: uses $($u.Key) before it is created (line $(Get-LineOf $vNl $evs[0].Pos))") }
+                } elseif ($last.Act -eq 'drop') {
+                  $errors.Add("$vFile line ${line}: uses $($u.Key) after it is dropped (line $(Get-LineOf $vNl $last.Pos))")
+                }
+              }
+              # The GO-separated batches, by position.
+              $batchStarts = @(0) + @([regex]::Matches($vText, '(?im)^[ \t]*GO[ \t]*\r?$') | ForEach-Object { $_.Index + $_.Length })
+              function Get-BatchStart([int]$pos) { $st = 0; foreach ($b in $batchStarts) { if ($b -le $pos) { $st = $b } else { break } }; $st }
+              function Get-BatchEnd([int]$pos) { foreach ($b in $batchStarts) { if ($b -gt $pos) { return $b } }; $vText.Length }
+              # A table/type/synonym/sequence created with an unguarded CREATE fails when it
+              # already exists (Msg 2714/219), unless this script dropped it first.
+              foreach ($e in $events) {
+                if ($e.Act -ne 'create' -or $e.Kind -notin 'TABLE', 'TYPE', 'SYNONYM', 'SEQUENCE') { continue }
+                $bs = Get-BatchStart $e.Pos
+                if ($vCode.Substring($bs, $e.Pos - $bs) -match '(?i)\bIF\b') { continue }   # IF ... IS NULL / IF NOT EXISTS (...)
+                if ((Test-ExistedBefore $e.Key) -and -not (Test-DroppedBefore $e.Key $e.Pos)) {
+                  $errors.Add("$vFile line $(Get-LineOf $vNl $e.Pos): CREATE $($e.Kind) $($e.Key) fails - it already exists and nothing drops it first; guard it (IF ... IS NULL) or drop it before")
+                }
+              }
+              # A column this script adds (ALTER TABLE t ADD c) can't be used before the ADD, nor by
+              # DML later in the same batch: SQL Server compiles the batch before the ALTER runs
+              # (Msg 207). DDL after it in the batch, and dynamic SQL, are fine. The table is one
+              # that existed before (its merge-base definition must lack the column) or one an
+              # earlier batch creates (that CREATE TABLE must lack it).
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bALTER\s+TABLE\s+(?<t>$SqlDefName)\s+(?:WITH\s+(?:NO)?CHECK\s+)?ADD\s+(?<c>\[[^\]]+\]|[A-Za-z_][\w@#$]*)")) {
+                $col = $m.Groups['c'].Value.Trim('[', ']')
+                if ($col -match '^(?i:CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK|INDEX|DEFAULT|PERIOD)$') { continue }
+                $tk = (ConvertTo-SqlKey $m.Groups['t'].Value).Key
+                $colRx = "(?i)(?<![\w@#$])(?:\[$([regex]::Escape($col))\]|$([regex]::Escape($col)))(?![\w@#$])"
+                $createdAt = @($events | Where-Object { $_.Key -eq $tk -and $_.Act -eq 'create' -and $_.Pos -lt $m.Index }) | Select-Object -Last 1
+                if ($createdAt) {
+                  $cs = $createdAt.Pos
+                  if ($vCode.Substring($cs, (Get-BatchEnd $cs) - $cs) -match $colRx) { continue }
+                } else {
+                  if (-not (Test-ExistedBefore $tk)) { continue }
+                  $tFile = (Get-Structure)[$tk]
+                  if ($mergeBase -and $tFile) {
+                    $baseDef = Get-CodeView ((git cat-file -p "${mergeBase}:$tFile" 2>$null) -join "`n"); $global:LASTEXITCODE = 0
+                    if ($baseDef -match $colRx) { continue }
+                  }
+                }
+                $from = if ($createdAt) { $createdAt.Pos } else { -1 }
+                $addAt = $m.Groups['c'].Index; $addBatch = Get-BatchStart $m.Index
+                # The code view keeps dynamic SQL; a copy with every comment and string blanked
+                # (by the same lexer) tells a mention inside EXEC('...') apart: that runs, and
+                # compiles, after the ADD.
+                if ($null -eq $vFlat) {
+                  $sb = New-Object System.Text.StringBuilder $vText
+                  foreach ($lm in $SqlLexRx.Matches($vText)) {
+                    if ($lm.Value[0] -eq '[' -or $lm.Value[0] -eq '"') { continue }
+                    for ($i = $lm.Index; $i -lt $lm.Index + $lm.Length; $i++) { if ($vText[$i] -ne "`n" -and $vText[$i] -ne "`r") { $sb[$i] = ' ' } }
+                  }
+                  $vFlat = $sb.ToString()
+                }
+                $hit = $null
+                foreach ($u in @($uses | Where-Object { $_.Key -eq $tk -and $_.Pos -gt $from -and $_.Pos -lt (Get-BatchEnd $m.Index) })) {
+                  $bs = Get-BatchStart $u.Pos; $be = Get-BatchEnd $u.Pos
+                  foreach ($cm in [regex]::Matches($vCode.Substring($bs, $be - $bs), $colRx)) {
+                    $at = $bs + $cm.Index
+                    if ($at -eq $addAt) { continue }
+                    if ($bs -eq $addBatch -and $at -gt $addAt) {
+                      # after the ADD in its own batch: only DML outside dynamic SQL fails
+                      if ($vFlat[$at] -eq ' ') { continue }
+                      $stmt = [regex]::Matches($vFlat.Substring($bs, $at - $bs), '(?i)\b(UPDATE|INSERT|SELECT|DELETE|MERGE|CREATE|ALTER)\b') | Select-Object -Last 1
+                      if (-not $stmt -or $stmt.Value -match '(?i)^(CREATE|ALTER)$') { continue }
+                    }
+                    $hit = $at; break
+                  }
+                  if ($null -ne $hit) { break }
+                }
+                if ($null -ne $hit) {
+                  $errors.Add("$vFile line $(Get-LineOf $vNl $hit): uses column $tk.$($col.ToLowerInvariant()) before it is added (line $(Get-LineOf $vNl $m.Index)); a use in the same batch fails too - put it after a GO")
+                }
+              }
+              # schemas and roles used before the script creates them
+              foreach ($sc in $schemaEvents.Keys) {
+                foreach ($u in $uses) { if ($u.Key.StartsWith("$sc.") -and $u.Pos -lt $schemaEvents[$sc]) { $errors.Add("$vFile line $(Get-LineOf $vNl $u.Pos): uses schema $sc before it is created (line $(Get-LineOf $vNl $schemaEvents[$sc]))"); break } }
+                foreach ($m in [regex]::Matches($vCode, "(?i)\bSCHEMA\s*::\s*(?<name>$SqlDefPart)")) {
+                  if ((@(Split-SqlName $m.Groups['name'].Value)[0]).ToLowerInvariant() -eq $sc -and $m.Index -lt $schemaEvents[$sc]) { $errors.Add("$vFile line $(Get-LineOf $vNl $m.Index): grants on schema $sc before it is created (line $(Get-LineOf $vNl $schemaEvents[$sc]))") }
+                }
+              }
+              foreach ($r in $roleEvents.Keys) {
+                foreach ($m in [regex]::Matches($vCode, "(?i)\b(?:TO|ALTER\s+ROLE|AUTHORIZATION)\s+(?<name>$SqlDefPart)")) {
+                  if ((@(Split-SqlName $m.Groups['name'].Value)[0]).ToLowerInvariant() -eq $r -and $m.Index -lt $roleEvents[$r]) { $errors.Add("$vFile line $(Get-LineOf $vNl $m.Index): uses role $r before it is created (line $(Get-LineOf $vNl $roleEvents[$r]))") }
+                }
+              }
+              # A lookup table this script creates and seeds must be seeded before a
+              # foreign key on an existing table validates against it (error 547 on
+              # any environment with data).
+              $tableStmts = @([regex]::Matches($vCode, "(?i)\b(?<verb>ALTER|CREATE)\s+TABLE\s+(?<name>$SqlDefName)") | ForEach-Object { @{ Pos = $_.Index; Verb = $_.Groups['verb'].Value.ToUpperInvariant(); Key = (ConvertTo-SqlKey $_.Groups['name'].Value).Key } })
+              $seedPos = @{}
+              foreach ($m in [regex]::Matches($vCode, "(?i)\b(?:INSERT\s+(?:INTO\s+)?|MERGE\s+(?:INTO\s+)?)(?<name>$SqlDefName)")) { $k = (ConvertTo-SqlKey $m.Groups['name'].Value).Key; if (-not $seedPos.ContainsKey($k)) { $seedPos[$k] = $m.Index } }
+              foreach ($m in [regex]::Matches($vCode, "(?i)\bREFERENCES\s+(?<name>$SqlDefName)")) {
+                $ref = (ConvertTo-SqlKey $m.Groups['name'].Value).Key
+                if (-not $seedPos.ContainsKey($ref) -or -not $byKey.ContainsKey($ref) -or -not (@($byKey[$ref] | Where-Object { $_.Act -eq 'create' -and $_.Kind -eq 'TABLE' }).Count)) { continue }
+                $stmt = $null; foreach ($ts in $tableStmts) { if ($ts.Pos -lt $m.Index) { $stmt = $ts } }
+                if (-not $stmt -or $stmt.Verb -ne 'ALTER') { continue }
+                $created = $byKey.ContainsKey($stmt.Key) -and @($byKey[$stmt.Key] | Where-Object { $_.Act -eq 'create' }).Count
+                if (-not $created -and $m.Index -lt $seedPos[$ref]) {
+                  # Existing rows are validated for a key on an existing column, or on
+                  # a new NOT NULL column with a default; not WITH NOCHECK, not a new
+                  # nullable column (all NULL).
+                  $stmtText = $vCode.Substring($stmt.Pos, $m.Index - $stmt.Pos)
+                  $msg = "$vFile line $(Get-LineOf $vNl $m.Index): the foreign key on $($stmt.Key) to $ref comes before $ref is seeded (line $(Get-LineOf $vNl $seedPos[$ref]))"
+                  if ($stmtText -match '(?i)\bWITH\s+NOCHECK\b') { }
+                  elseif ($stmtText -match '(?i)\bADD\s+CONSTRAINT\s+\S+\s+FOREIGN\s+KEY\b' -or ($stmtText -match '(?i)\bNOT\s+NULL\b' -and $stmtText -match '(?i)\bDEFAULT\b')) { $errors.Add("$msg - existing rows are validated against it, so on an environment with data it fails with error 547") }
+                  else { $warnings.Add("$msg - seed it first, as the skill requires") }
+                }
+              }
+              foreach ($e in $events) { if ($e.Act -eq 'create' -and -not $vCreated.ContainsKey($e.Key)) { $vCreated[$e.Key] = $e } }
+              # what the V__ drops for good (no later CREATE)
+              foreach ($k in $byKey.Keys) { $evs = $byKey[$k]; $lastEv = $evs[$evs.Count - 1]; if ($lastEv.Act -eq 'drop' -and $lastEv.Kind -ne 'RENAME') { $vDropped.Add($lastEv) } }
+
+              # A dropped type: what used it at the merge base must go first. A
+              # dropped table: other tables' foreign keys to it likewise.
+              foreach ($d in $events) {
+                if ($d.Act -ne 'drop' -or $d.Kind -notin @('TYPE', 'TABLE') -or -not $mergeBase) { continue }
+                $line = Get-LineOf $vNl $d.Pos
+                if ($d.Kind -eq 'TYPE') {
+                  foreach ($u in @(Get-TypeUsers $mergeBase $env:DATABASE $d.Schema $d.Name)) {
+                    if ($u.Kind -eq 'COLUMN') {
+                      $changed = @($tableStmts | Where-Object { $_.Key -eq $u.Key -and $_.Verb -eq 'ALTER' -and $_.Pos -lt $d.Pos }).Count -or (Test-DroppedBefore $u.Key $d.Pos)
+                      if (-not $changed) { $errors.Add("$vFile line ${line}: DROP TYPE $($d.Key) fails - table $($u.Key) has a column of it; change that column first") }
+                    } elseif (-not (Test-DroppedBefore $u.Key $d.Pos)) {
+                      $how = if ($u.Kind -eq 'TYPE') { 'drop it first, and re-create it after' } else { 'drop it first (the repeatable migration re-creates it)' }
+                      $errors.Add("$vFile line ${line}: DROP TYPE $($d.Key) fails - $($u.Kind.ToLower()) $($u.Key) still uses it; $how")
+                    }
+                  }
+                } else {
+                  foreach ($fk in @(Get-ForeignKeysTo $mergeBase $env:DATABASE $d.Schema $d.Name)) {
+                    if (Test-DroppedBefore $fk.Owner $d.Pos) { continue }
+                    if ($fk.Constraint) {
+                      $gone = @([regex]::Matches($vCode, "(?i)\bDROP\s+CONSTRAINT\s+(?:IF\s+EXISTS\s+)?(?<c>$SqlDefPart)") | Where-Object { (@(Split-SqlName $_.Groups['c'].Value)[0]) -ieq $fk.Constraint -and $_.Index -lt $d.Pos }).Count
+                      if (-not $gone) { $errors.Add("$vFile line ${line}: DROP TABLE $($d.Key) fails - foreign key $($fk.Constraint) on $($fk.Owner) still references it; drop the constraint first") }
+                    } else {
+                      # an unnamed key has a generated name: it can only be dropped by
+                      # looking it up, in a batch that names its table
+                      $ownerName = ($fk.Owner -split '\.', 2)[1]
+                      $before = $vText.Substring(0, $d.Pos)
+                      if (-not ($before -match '(?i)\bDROP\s+CONSTRAINT\b' -and $before -match ('(?i)' + [regex]::Escape($ownerName)) -and $before -match '(?i)\bsys\.foreign_keys\b')) {
+                        $errors.Add("$vFile line ${line}: DROP TABLE $($d.Key) fails - an unnamed foreign key on $($fk.Owner) still references it; drop that key first (look it up in sys.foreign_keys)")
+                      }
+                    }
+                  }
+                }
+              }
+
+              # an object this PR adds as a repeatable one does not exist yet while the V__ runs
+              $added = @{}
+              foreach ($f in $statusOf.Keys) {
+                if ($statusOf[$f] -eq 'A' -and $f -match '[/\\](Views|Stored Procedures?|Functions|Triggers)[/\\]' -and (Test-Path $f)) {
+                  $o = Get-DefinedObject ([System.IO.File]::ReadAllText((Resolve-Path $f).Path)); if ($o) { $added[$o.Key] = $o.Kind }
+                }
+              }
+              foreach ($u in $uses) {
+                if ($u.Named -or -not $added.ContainsKey($u.Key) -or $vCreated.ContainsKey($u.Key)) { continue }
+                $errors.Add("$vFile line $(Get-LineOf $vNl $u.Pos): uses $($added[$u.Key]) $($u.Key), which this PR adds in the repeatable migration - Flyway runs that after the versioned one, so it does not exist yet. Ship $($u.Key) in an earlier PR")
+              }
+              # a view or function in the R__ cannot name what the V__ dropped
+              $gone = @{}; foreach ($x in $vDropped) { if (-not $rDefs.ContainsKey($x.Key)) { $gone[$x.Key] = $x } }
+              foreach ($sg in $rSegments) {
+                if ($sg.Kind -notin @('VIEW', 'FUNCTION')) { continue }
+                foreach ($ref in @(Get-SqlReferences $sg.Code $env:DATABASE)) {
+                  if ($gone.ContainsKey($ref.Key)) { $errors.Add("$rFile line $($sg.Line): $($sg.Kind) $($sg.Key) references $($ref.Key), which the versioned migration drops (line $(Get-LineOf $vNl $gone[$ref.Key].Pos))") }
+                }
+              }
+              # a repeatable object the V__ drops for good must come back from the R__
+              foreach ($x in $vDropped) {
+                if ($x.Kind -notin @('PROCEDURE', 'FUNCTION', 'VIEW', 'TRIGGER')) { continue }
+                $entry = (Get-Catalogue)[$x.Key]
+                if ($entry -and -not $rDefs.ContainsKey($x.Key)) { $errors.Add("$vFile line $(Get-LineOf $vNl $x.Pos): drops $($x.Kind) $($x.Key), which is still in $($entry.File), and the repeatable migration does not re-create it - it would be missing after the deployment") }
+              }
+            }
+          } catch {
+            Write-Host "::warning::The object-order check could not run: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"
+            $global:LASTEXITCODE = 0
+            exit 0
+          }
+
+          $uniqueErrors = @($errors | Select-Object -Unique); $uniqueWarnings = @($warnings | Select-Object -Unique)
+          $vr = if (Test-Path "validation_results.json") { Get-Content "validation_results.json" -Raw | ConvertFrom-Json } else { $null }
+          $result = [ordered]@{
+            errors   = @(@($vr.errors | Where-Object { $_ }) + @($uniqueErrors | ForEach-Object { "[object order] $_" }))
+            warnings = @(@($vr.warnings | Where-Object { $_ }) + @($uniqueWarnings | ForEach-Object { "[object order] $_" }))
+            passed   = ($(if ($vr) { [bool]$vr.passed } else { $true }) -and $uniqueErrors.Count -eq 0)
+          }
+          $result | ConvertTo-Json -Depth 5 | Out-File "validation_results.json" -Encoding UTF8
+          foreach ($w in $uniqueWarnings) { Write-Host "::warning::$w" }
+          $global:LASTEXITCODE = 0
+          if ($uniqueErrors.Count -gt 0) {
+            foreach ($e in $uniqueErrors) { Write-Host "::error::$e" }
+            Write-Host "Object order check FAILED - $($uniqueErrors.Count) problem(s); the scripts would fail to deploy in this order"
+            exit 1
+          }
+          Write-Host "Object order check passed ($(if ($rText) { 'R__' }) $(if ($vText) { 'V__' }))"
+
+      - name: Update CI/CD role permissions
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "========================================="
+          Write-Host "UPDATE CI/CD ROLE PERMISSIONS"
+          Write-Host "========================================="
+
+          $database = $env:DATABASE
+
+          # Step 1: Find role file dynamically (supports flat + nested Security structures)
+          $roleFile = $null
+          $candidatePaths = @(
+            "$database/Security/role_app_ci.sql",
+            "$database/Security/Roles/role_app_ci.sql"
+          )
+
+          foreach ($path in $candidatePaths) {
+            if (Test-Path $path) {
+              $roleFile = $path
+              Write-Host "Found role file: $roleFile"
+              break
+            }
+          }
+
+          if (-not $roleFile) {
+            Write-Host "::warning::role_app_ci.sql not found in any expected location, skipping role permissions update"
+            echo "ROLE_PERMISSIONS_UPDATED=false" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          # Step 2: Discover schema directories from database folder
+          $excludeDirs = @('bin', 'obj', 'Scripts', 'Security', 'Storage', 'external-refs', 'Properties', '.vs')
+
+          $schemaDirs = @(Get-ChildItem -Path $database -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -notin $excludeDirs } |
+                        Select-Object -ExpandProperty Name)
+
+          if ($schemaDirs.Count -eq 0) {
+            Write-Host "No schema directories found in $database/, skipping"
+            echo "ROLE_PERMISSIONS_UPDATED=false" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          Write-Host "`nDiscovered $($schemaDirs.Count) schema directories:"
+          $schemaDirs | Sort-Object | ForEach-Object { Write-Host "  - $_" }
+
+          # Step 3: Parse existing grants from role file
+          $roleContent = Get-Content $roleFile -Raw
+          $existingSchemas = @([regex]::Matches($roleContent, 'GRANT\s+ALTER\s+ON\s+SCHEMA::\[(\w+)\]') |
+                             ForEach-Object { $_.Groups[1].Value } |
+                             Select-Object -Unique)
+
+          Write-Host "`nSchemas already granted in role file ($($existingSchemas.Count)):"
+          $existingSchemas | Sort-Object | ForEach-Object { Write-Host "  - $_" }
+
+          # Step 4: Identify missing schemas
+          $missingSchemas = @($schemaDirs | Where-Object { $_ -notin $existingSchemas } | Sort-Object)
+
+          if ($missingSchemas.Count -eq 0) {
+            Write-Host "`nNo new schemas detected - all schema directories already have role permissions"
+            echo "ROLE_PERMISSIONS_UPDATED=false" >> $env:GITHUB_ENV
+            exit 0
+          }
+
+          Write-Host "`nNew schemas detected ($($missingSchemas.Count)):"
+          $missingSchemas | ForEach-Object { Write-Host "  + $_" }
+
+          # Step 5: Update source role file - insert new grants alphabetically before flyway table grants
+          $permissions = @('ALTER', 'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'EXECUTE', 'REFERENCES')
+          $roleLines = Get-Content $roleFile
+
+          # Find the flyway grants line (insertion point - insert before this)
+          $flywayLineIndex = -1
+          for ($i = 0; $i -lt $roleLines.Count; $i++) {
+            if ($roleLines[$i] -match 'GRANT\s+SELECT.*ON\s+dbo\.flyway_schema_history') {
+              $flywayLineIndex = $i
+              break
+            }
+          }
+
+          if ($flywayLineIndex -eq -1) {
+            Write-Host "::warning::Could not find flyway_schema_history grant in role file - appending grants at end"
+            $flywayLineIndex = $roleLines.Count
+          }
+
+          # Build new grants in SSDT style (individual GOs per statement)
+          $newGrantLines = @()
+          foreach ($schema in $missingSchemas) {
+            foreach ($perm in $permissions) {
+              $newGrantLines += "GRANT $perm ON SCHEMA::[$schema] TO [role_app_ci];"
+              $newGrantLines += "GO"
+              $newGrantLines += ""
+            }
+          }
+
+          # Insert before flyway grants
+          $updatedRoleLines = @()
+          if ($flywayLineIndex -gt 0) {
+            $updatedRoleLines += $roleLines[0..($flywayLineIndex - 1)]
+          }
+          $updatedRoleLines += $newGrantLines
+          if ($flywayLineIndex -lt $roleLines.Count) {
+            $updatedRoleLines += $roleLines[$flywayLineIndex..($roleLines.Count - 1)]
+          }
+
+          Set-Content -Path $roleFile -Value ($updatedRoleLines -join "`n") -Encoding UTF8 -NoNewline
+          Write-Host "`nUpdated role file with $($missingSchemas.Count) new schema grant block(s)"
+
+          # Step 6: Save results
+          $results = @{
+            roleFile = $roleFile
+            newSchemas = @($missingSchemas)
+            schemasCount = $missingSchemas.Count
+            permissionsPerSchema = $permissions.Count
+            totalNewGrants = $missingSchemas.Count * $permissions.Count
+          }
+          $results | ConvertTo-Json -Depth 5 | Out-File "role_permissions_update.json" -Encoding UTF8
+
+          echo "ROLE_PERMISSIONS_UPDATED=true" >> $env:GITHUB_ENV
+          echo "NEW_SCHEMAS_ADDED=$($missingSchemas -join ',')" >> $env:GITHUB_ENV
+
+          Write-Host "`n========================================="
+          Write-Host "RESULT: Added permissions for $($missingSchemas.Count) new schema(s): $($missingSchemas -join ', ')"
+          Write-Host "========================================="
+
+      - name: Update Visual Studio project file
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Dynamically updating Visual Studio project file with wildcard patterns..."
+
+          # Auto-detect the .sqlproj file
+          $database = $env:DATABASE
+          $projectFile = Get-ChildItem -Filter "*.sqlproj" -Recurse -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Directory.Name -eq $database } |
+                         Select-Object -First 1 -ExpandProperty FullName
+
+          if (-not $projectFile) {
+            Write-Host "::warning::No .sqlproj file found in $database folder"
+            exit 0
+          }
+
+          Write-Host "Found project file: $projectFile"
+          $projectDir = Split-Path $projectFile -Parent
+          $projectDirName = Split-Path $projectDir -Leaf
+          $escapedDirName = [regex]::Escape($projectDirName)
+
+          # Read the changed files
+          if (-not (Test-Path "changed_files.txt")) {
+            Write-Host "No changed files detected"
+            exit 0
+          }
+
+          $changedFilesRaw = Get-Content "changed_files.txt" -Raw
+          $lines = $changedFilesRaw -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+
+          # Collect all folder paths from changed files
+          $foldersNeeded = @{}
+          foreach ($line in $lines) {
+            $parts = $line -split "`t"
+            if ($parts.Count -lt 2) {
+              $parts = $line -split '\s+', 2
+            }
+
+            $status = $parts[0].Trim()
+
+            # Handle rename status
+            if ($status -match '^R\d*$' -and $parts.Count -ge 3) {
+              $files = @($parts[1].Trim(), $parts[2].Trim())
+            } else {
+              $files = @($parts[1].Trim())
+            }
+
+            foreach ($file in $files) {
+              # Only process files in project directory (not Migration/)
+              if ($file -notmatch "^$escapedDirName/.*\.sql$") {
+                continue
+              }
+
+              # Extract folder path
+              $relativePath = $file -replace "^$escapedDirName/", "" -replace "/", "\"
+              $folderPath = Split-Path $relativePath -Parent
+
+              if ($folderPath) {
+                $foldersNeeded[$folderPath] = $true
+              }
+            }
+          }
+
+          if ($foldersNeeded.Count -eq 0) {
+            Write-Host "No folders to process"
+
+            $projectUpdateInfo = @{
+              updated = $false
+              foldersAdded = 0
+              wildcardsAdded = 0
+            }
+            $projectUpdateInfo | ConvertTo-Json | Out-File "project_update.json" -Encoding UTF8
+            exit 0
+          }
+
+          Write-Host "`nFolders detected from changed files:"
+          $foldersNeeded.Keys | Sort-Object | ForEach-Object { Write-Host "  - $_" }
+
+          # Load the project file
+          [xml]$proj = Get-Content $projectFile
+          $ns = New-Object System.Xml.XmlNamespaceManager($proj.NameTable)
+          $ns.AddNamespace("msb", "http://schemas.microsoft.com/developer/msbuild/2003")
+
+          $modified = $false
+          $foldersAdded = 0
+          $wildcardsAdded = 0
+
+          # Find or create Folder ItemGroup
+          $folderItemGroup = $proj.SelectSingleNode("//msb:Project/msb:ItemGroup[msb:Folder]", $ns)
+          if ($null -eq $folderItemGroup) {
+            Write-Host "`nCreating new Folder ItemGroup"
+            $folderItemGroup = $proj.CreateElement("ItemGroup", $proj.DocumentElement.NamespaceURI)
+            $proj.DocumentElement.AppendChild($folderItemGroup) | Out-Null
+            $modified = $true
+          }
+
+          # Find or create Build ItemGroup
+          $buildItemGroup = $proj.SelectSingleNode("//msb:Project/msb:ItemGroup[msb:Build]", $ns)
+          if ($null -eq $buildItemGroup) {
+            Write-Host "`nCreating new Build ItemGroup"
+            $buildItemGroup = $proj.CreateElement("ItemGroup", $proj.DocumentElement.NamespaceURI)
+            $proj.DocumentElement.AppendChild($buildItemGroup) | Out-Null
+            $modified = $true
+          }
+
+          # Process each folder
+          foreach ($folder in $foldersNeeded.Keys | Sort-Object) {
+            $folderWithSlash = "$folder\"
+            $wildcardPattern = "$folder\*.sql"
+
+            # Check if folder entry exists
+            $escapedFolder = $folderWithSlash -replace "'", "&apos;"
+            $existingFolder = $proj.SelectSingleNode("//msb:Folder[@Include='$escapedFolder']", $ns)
+
+            if ($null -eq $existingFolder) {
+              Write-Host "`n  Adding folder: $folderWithSlash"
+              $newFolder = $proj.CreateElement("Folder", $proj.DocumentElement.NamespaceURI)
+              $newFolder.SetAttribute("Include", $folderWithSlash)
+              $folderItemGroup.AppendChild($newFolder) | Out-Null
+              $modified = $true
+              $foldersAdded++
+            }
+
+            # Check if wildcard pattern exists
+            $escapedPattern = $wildcardPattern -replace "'", "&apos;"
+            $existingWildcard = $proj.SelectSingleNode("//msb:Build[@Include='$escapedPattern']", $ns)
+
+            if ($null -eq $existingWildcard) {
+              Write-Host "  Adding wildcard: $wildcardPattern"
+              $newBuild = $proj.CreateElement("Build", $proj.DocumentElement.NamespaceURI)
+              $newBuild.SetAttribute("Include", $wildcardPattern)
+              $buildItemGroup.AppendChild($newBuild) | Out-Null
+              $modified = $true
+              $wildcardsAdded++
+            } else {
+              Write-Host "  Wildcard already exists: $wildcardPattern"
+            }
+          }
+
+          if ($modified) {
+            $proj.Save($projectFile)
+            Write-Host "`n✅ Project file updated: +$foldersAdded folder(s), +$wildcardsAdded wildcard(s)"
+
+            # Save project update status for PR comment
+            $projectUpdateInfo = @{
+              updated = $true
+              foldersAdded = $foldersAdded
+              wildcardsAdded = $wildcardsAdded
+            }
+            $projectUpdateInfo | ConvertTo-Json | Out-File "project_update.json" -Encoding UTF8
+          } else {
+            Write-Host "`nNo project file changes needed - all folders and wildcards already exist"
+
+            # Save empty status
+            $projectUpdateInfo = @{
+              updated = $false
+              foldersAdded = 0
+              wildcardsAdded = 0
+            }
+            $projectUpdateInfo | ConvertTo-Json | Out-File "project_update.json" -Encoding UTF8
+          }
+
+      - name: Sync .sqlproj for deleted files
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          $database = $env:DATABASE
+          $sqlprojFile = Get-ChildItem -Path $database -Filter "*.sqlproj" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $sqlprojFile) { Write-Host "No .sqlproj found, skipping"; exit 0 }
+
+          Write-Host "Checking .sqlproj for stale file references..."
+          $projDir = $sqlprojFile.Directory.FullName
+
+          [xml]$proj = Get-Content $sqlprojFile.FullName -Raw
+          $ns = New-Object System.Xml.XmlNamespaceManager($proj.NameTable)
+          $ns.AddNamespace("msb", $proj.DocumentElement.NamespaceURI)
+
+          $staleEntries = @()
+
+          # Check Build Include entries (specific files only, skip wildcards)
+          foreach ($node in $proj.SelectNodes("//msb:Build[@Include]", $ns)) {
+            $include = $node.GetAttribute("Include")
+            if ($include -match '\*') { continue }
+            $fullPath = Join-Path $projDir ($include.Replace("/", "\"))
+            if (-not (Test-Path $fullPath)) {
+              $staleEntries += @{ Path = $include; Node = $node; Type = "Build" }
+            }
+          }
+
+          # Check None Include entries (non-compiled SQL files)
+          foreach ($node in $proj.SelectNodes("//msb:None[@Include]", $ns)) {
+            $include = $node.GetAttribute("Include")
+            if ($include -match '\*') { continue }
+            if (-not ($include -match '\.sql$')) { continue }
+            $fullPath = Join-Path $projDir ($include.Replace("/", "\"))
+            if (-not (Test-Path $fullPath)) {
+              $staleEntries += @{ Path = $include; Node = $node; Type = "None" }
+            }
+          }
+
+          if ($staleEntries.Count -eq 0) {
+            Write-Host "No stale references found - .sqlproj is clean"
+            exit 0
+          }
+
+          Write-Host "Removing $($staleEntries.Count) stale reference(s):"
+          foreach ($entry in $staleEntries) {
+            Write-Host "  [$($entry.Type)] - $($entry.Path)"
+            $entry.Node.ParentNode.RemoveChild($entry.Node) | Out-Null
+          }
+
+          # Clean up empty ItemGroups
+          foreach ($g in $proj.SelectNodes("//msb:ItemGroup[not(*)]", $ns)) {
+            $g.ParentNode.RemoveChild($g) | Out-Null
+          }
+
+          $proj.Save($sqlprojFile.FullName)
+          Write-Host ".sqlproj cleaned: removed $($staleEntries.Count) stale reference(s)"
+
+      - name: Commit and push changes
+        if: env.HAS_CHANGES == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "Committing and pushing migration scripts and project file..."
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add Migration/
+
+          # Add project file if it exists
+          $projectFile = Get-ChildItem -Filter "*.sqlproj" -Recurse -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Directory.Name -eq $env:DATABASE } |
+                         Select-Object -First 1 -ExpandProperty FullName
+          if ($projectFile -and (Test-Path $projectFile)) {
+            $relativeProjectPath = Resolve-Path -Relative $projectFile
+            git add $relativeProjectPath
+          }
+
+          # Add role file if it was updated
+          if ($env:ROLE_PERMISSIONS_UPDATED -eq 'true' -and (Test-Path "role_permissions_update.json")) {
+            $roleUpdate = Get-Content "role_permissions_update.json" -Raw | ConvertFrom-Json
+            if ($roleUpdate.roleFile -and (Test-Path $roleUpdate.roleFile)) {
+              git add $roleUpdate.roleFile
+              Write-Host "Added updated role file: $($roleUpdate.roleFile)"
+            }
+          }
+
+          $status = git status --porcelain
+          if ([string]::IsNullOrWhiteSpace($status)) {
+            Write-Host "No changes to commit"
+            exit 0
+          }
+
+          # Check what files are staged
+          $stagedFiles = git diff --cached --name-only
+          $hasProjectFile = $stagedFiles | Where-Object { $_ -like "*.sqlproj" } | Select-Object -First 1
+          $hasRoleFile = $stagedFiles | Where-Object { $_ -like "*role_app_ci*" } | Select-Object -First 1
+
+          $commitParts = @("migration scripts")
+          if ($hasProjectFile) { $commitParts += "project file" }
+          if ($hasRoleFile) { $commitParts += "CI/CD role permissions" }
+
+          $commitMsg = "chore: Generate " + ($commitParts -join ", ") + " [automated]"
+          git commit -m $commitMsg
+
+          $maxRetries = 5
+          $success = $false
+          for ($i = 1; $i -le $maxRetries; $i++) {
+            git push
+            if ($LASTEXITCODE -eq 0) { $success = $true; break }
+            if ($i -eq $maxRetries) { break }
+
+            # Brief backoff so a concurrent commit lands before we re-fetch,
+            # widening the race window each attempt.
+            $sleepSec = [Math]::Min(16, [Math]::Pow(2, $i - 1))
+            Write-Host "::warning::Push rejected on attempt $i/$maxRetries - sleeping ${sleepSec}s, then fetching and rebasing on origin/$env:BRANCH_NAME"
+            Start-Sleep -Seconds $sleepSec
+
+            # Explicit refspec (`+<branch>:refs/remotes/origin/<branch>`) is REQUIRED
+            # here. Without it, `git fetch origin <branch>` only updates FETCH_HEAD
+            # on a checkout configured by actions/checkout — `refs/remotes/origin/<branch>`
+            # stays at the stale tip from initial checkout. The subsequent
+            # `git rebase origin/<branch>` then sees no new commits ("Current
+            # branch is up to date"), and the next push fails non-fast-forward
+            # again. The `+` prefix also allows the remote-tracking ref to move
+            # backwards if the remote branch was force-pushed.
+            git fetch origin "+$($env:BRANCH_NAME):refs/remotes/origin/$($env:BRANCH_NAME)"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::git fetch failed - aborting"
+              exit 1
+            }
+            git rebase "origin/$env:BRANCH_NAME"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Rebase conflict during push retry - manual intervention required"
+              git rebase --abort
+              exit 1
+            }
+          }
+
+          if ($success) {
+            Write-Host "Migration scripts committed and pushed successfully"
+          } else {
+            Write-Host "::error::Push failed after $maxRetries attempts (remote keeps advancing)"
+            exit 1
+          }
+
+      - name: Upload diagnostic artifacts on failure
+        # `if: failure()` evaluates against the job status accumulated so far,
+        # so placing this near the end of the job captures failures from any
+        # prior step (Claude API parse, source build, validation, push, etc).
+        # Without this, claude_response.txt and friends die with the runner
+        # and the only signal left is the (often unhelpful) log snippet.
+        if: failure() && env.HAS_CHANGES == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: migration-debug-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            claude_response.txt
+            claude_context.json
+            migration_scripts.json
+            impact_analysis.json
+            validation_results.json
+            security_audit.json
+            changed_files.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Comment on PR
+        if: env.HAS_CHANGES == 'true' && github.event_name == 'pull_request'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const fs = require('fs');
+            
+            if (!fs.existsSync('migration_scripts.json')) {
+              console.log('migration_scripts.json not found, skipping PR comment');
+              return;
+            }
+            
+            if (!fs.existsSync('validation_results.json')) {
+              console.log('validation_results.json not found, skipping PR comment');
+              return;
+            }
+            
+            const migrationScripts = JSON.parse(fs.readFileSync('migration_scripts.json', 'utf8'));
+            const validationResults = JSON.parse(fs.readFileSync('validation_results.json', 'utf8'));
+
+            // Check if project file was updated
+            let projectUpdate = { updated: false, filesAdded: 0, filesRemoved: 0 };
+            if (fs.existsSync('project_update.json')) {
+              projectUpdate = JSON.parse(fs.readFileSync('project_update.json', 'utf8'));
+            }
+
+            let commentBody = '## Migration Scripts Generated\n\n';
+            
+            commentBody += '### Validation Status\n';
+            if (validationResults.passed) {
+              commentBody += '✅ **All validation checks passed**\n\n';
+            } else {
+              commentBody += '❌ **Validation failed with errors**\n\n';
+            }
+            
+            if (validationResults.errors && validationResults.errors.length > 0) {
+              commentBody += '#### ❌ Critical Errors:\n';
+              validationResults.errors.forEach(error => {
+                commentBody += `- ${error}\n`;
+              });
+              commentBody += '\n';
+            }
+            
+            if (validationResults.warnings && validationResults.warnings.length > 0) {
+              commentBody += '#### ⚠️ Warnings:\n';
+              validationResults.warnings.forEach(warning => {
+                commentBody += `- ${warning}\n`;
+              });
+              commentBody += '\n';
+            }
+            
+            commentBody += '### Summary\n';
+            commentBody += migrationScripts.summary + '\n\n';
+            
+            commentBody += '### Created Scripts\n';
+            if (migrationScripts.repeatableMigration) {
+              commentBody += `- ✅ \`${migrationScripts.repeatableMigration.filename}\` (Repeatable)\n`;
+            }
+            if (migrationScripts.versionMigration) {
+              commentBody += `- ✅ \`${migrationScripts.versionMigration.filename}\` (Version)\n`;
+            }
+            if (!migrationScripts.repeatableMigration && !migrationScripts.versionMigration) {
+              commentBody += 'No migration scripts generated.\n';
+            }
+            commentBody += '\n';
+
+            // Add project file update info
+            if (projectUpdate.updated) {
+              commentBody += '### Visual Studio Project Updated\n';
+              commentBody += `The \`${process.env.DATABASE}.sqlproj\` file was automatically updated with wildcard patterns:\n`;
+              if (projectUpdate.foldersAdded > 0) {
+                commentBody += `- 📁 Added ${projectUpdate.foldersAdded} folder(s)\n`;
+              }
+              if (projectUpdate.wildcardsAdded > 0) {
+                commentBody += `- 🔀 Added ${projectUpdate.wildcardsAdded} wildcard pattern(s) (schema\\*.sql)\n`;
+              }
+              commentBody += '\n**Dynamic Wildcard Management**: New SQL files are automatically included without explicit entries, preventing MSBuild errors and avoiding the 2100 character limit.\n\n';
+            }
+
+            // Add CI/CD role permissions update info
+            let roleUpdate = { newSchemas: [], schemasCount: 0 };
+            if (fs.existsSync('role_permissions_update.json')) {
+              roleUpdate = JSON.parse(fs.readFileSync('role_permissions_update.json', 'utf8'));
+            }
+
+            if (roleUpdate.schemasCount > 0) {
+              commentBody += '### CI/CD Role Permissions Updated\n';
+              commentBody += `The \`role_app_ci.sql\` file was automatically updated with schema-level permissions for **${roleUpdate.schemasCount}** new schema(s):\n`;
+              roleUpdate.newSchemas.forEach(schema => {
+                commentBody += `- 🔐 \`${schema}\` (ALTER, SELECT, INSERT, UPDATE, DELETE, EXECUTE, REFERENCES)\n`;
+              });
+              commentBody += `\n**Total new grants**: ${roleUpdate.totalNewGrants} (${roleUpdate.permissionsPerSchema} permissions x ${roleUpdate.schemasCount} schema(s))\n\n`;
+            }
+
+            // Impact Analysis section
+            if (fs.existsSync('impact_analysis.json')) {
+              const impact = JSON.parse(fs.readFileSync('impact_analysis.json', 'utf8'));
+              if (impact.schemas && impact.schemas.length > 0) {
+                commentBody += '### Impact Analysis\n';
+                commentBody += '| Schema | Risk | Change Type | Details |\n';
+                commentBody += '|--------|------|-------------|---------|\n';
+                impact.schemas.forEach(s => {
+                  commentBody += `| ${s.name} | ${s.risk} | ${s.changeType} | ${s.reason} |\n`;
+                });
+                commentBody += `\n**Overall Risk**: ${impact.overallRisk}`;
+                if (impact.crossDatabaseImpact && impact.crossDatabaseImpact.length > 0) {
+                  commentBody += ` | **Cross-database**: ${impact.crossDatabaseImpact.join(', ')}`;
+                }
+                commentBody += '\n\n';
+
+                // Object dependencies section
+                if (impact.dependencies && impact.dependencies.length > 0) {
+                  commentBody += `<details>\n<summary>Object Dependencies (${impact.dependencies.length} object(s) with references)</summary>\n\n`;
+                  impact.dependencies.forEach(dep => {
+                    commentBody += `**\`${dep.droppedObject}\`** (${dep.changeType}) — referenced by ${dep.refCount} object(s):\n`;
+                    dep.referencedBy.forEach(ref => {
+                      commentBody += `- \`${ref}\`\n`;
+                    });
+                    commentBody += '\n';
+                  });
+                  commentBody += '</details>\n\n';
+                }
+              }
+            }
+
+            // Security Audit section
+            if (fs.existsSync('security_audit.json')) {
+              const audit = JSON.parse(fs.readFileSync('security_audit.json', 'utf8'));
+              commentBody += '### Security Audit\n';
+              if (audit.passed && (!audit.warnings || audit.warnings.length === 0)) {
+                commentBody += `✅ All permission checks passed (${audit.statements ? audit.statements.length : 0} GRANT statement(s) validated)\n\n`;
+              } else {
+                if (audit.issues && audit.issues.length > 0) {
+                  commentBody += `❌ ${audit.issues.length} issue(s) found:\n`;
+                  audit.issues.forEach(i => { commentBody += `- ${i}\n`; });
+                  commentBody += '\n';
+                }
+                if (audit.warnings && audit.warnings.length > 0) {
+                  commentBody += `⚠️ ${audit.warnings.length} warning(s):\n`;
+                  audit.warnings.forEach(w => { commentBody += `- ${w}\n`; });
+                  commentBody += '\n';
+                }
+                if (audit.passed && audit.issues.length === 0) {
+                  commentBody += `✅ Passed with ${audit.warnings.length} warning(s) (${audit.statements ? audit.statements.length : 0} statement(s))\n\n`;
+                }
+              }
+            }
+
+            commentBody += '### Next Steps\n';
+            commentBody += '1.  Review the generated migration scripts in the `Migration/` folder\n';
+            commentBody += '2.  Check validation results above\n';
+            if (validationResults.warnings && validationResults.warnings.length > 0) {
+              commentBody += '3.  Address any warnings before deploying\n';
+              commentBody += '4.  Test in Staging database environment where migration scripts are deployed\n';
+              commentBody += '5.  Merge the PR when ready\n';
+            } else {
+              commentBody += '3.  Test in Staging database environment where migration scripts are deployed\n';
+              commentBody += '4.  Merge the PR when ready\n';
+            }
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: commentBody
+            });

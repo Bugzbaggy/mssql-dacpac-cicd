@@ -1,0 +1,22 @@
+#!/bin/sh
+# =============================================
+# commit-msg hook
+# Purpose: Ensure every commit carries a "Co-authored-by: Claude" trailer.
+# Scope:   Repo-wide. Activated per-clone via core.hooksPath=.githooks
+#          (run scripts/setup-hooks.sh or scripts/setup-hooks.ps1 once).
+# Notes:   Claude must never be the commit AUTHOR (see CLAUDE.md Author
+#          Guidelines) — this only adds Claude as a CO-author.
+# =============================================
+
+COMMIT_MSG_FILE="$1"
+
+# Already co-authored by Claude? Leave the message untouched.
+if grep -qi '^Co-authored-by:[[:space:]]*Claude' "$COMMIT_MSG_FILE"; then
+	exit 0
+fi
+
+# Append the trailer into the message's trailer block (handles spacing and
+# placement alongside any existing trailers correctly).
+git interpret-trailers \
+	--trailer "Co-authored-by: Claude <noreply@anthropic.com>" \
+	--in-place "$COMMIT_MSG_FILE"
