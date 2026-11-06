@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# pre-commit: what git checks before each commit in this clone, in order:
+#   1. sql-doc-gate.sh   blocks while the branch's .sql changes are newer than their docs
+#   2. pr-ready-hook.sh  reminds, never blocks, when the commit's changes haven't had
+#                        /review-before-commit
+#   3. nitsql            analyze_sql.py on the staged .sql files: a CRITICAL finding blocks the
+#                        commit, anything else is printed and the commit goes ahead
+#
+# nitsql reads a copy of what is staged, the version the commit will hold, so an unstaged edit can
+# neither hide a finding nor add one. With no Python 3.8+ or no analyzer, step 3 says so and lets
+# the commit through: nitsql.yml runs the same analysis on every pull request.
+# git commit --no-verify skips all three for one commit.
+
+set -u
+
+HOOK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ANALYZER="$HOOK_DIR/analyze_sql.py"
+note() { echo "[nitsql] $*"; }
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+bash "$HOOK_DIR/sql-doc-gate.sh" || exit 1
+[ -f "$HOOK_DIR/pr-ready-hook.sh" ] && bash "$HOOK_DIR/pr-ready-hook.sh" pre-commit
+
+STAGED=()
+while IFS= read -r -d '' f; do STAGED+=("$f"); done \
+	< <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.sql')
+[ ${#STAGED[@]} -gt 0 ] || exit 0
+
+if [ ! -f "$ANALYZER" ]; then
+	note "No analyzer at .githooks/analyze_sql.py, so the staged SQL is not checked here; nitsql.yml checks the pull request."
+	exit 0
+fi
+
+python_cmd() {   # python_cmd: the first interpreter on PATH that runs and is Python 3.8 or later
+	local c
+	for c in python3 python py; do
+		command -v "$c" >/dev/null 2>&1 || continue
+		if "$c" -c 'import sys; sys.exit(sys.version_info < (3, 8))' >/dev/null 2>&1; then
+			echo "$c"
+			return 0
+		fi
+	done
+	return 1
+}
+if ! PY="$(python_cmd)"; then
+	note "No Python 3.8 or later on PATH, so the staged SQL is not checked here; nitsql.yml checks the pull request."
+	exit 0
+fi
+
+# The staged copies go under the git dir, so the paths the analyzer prints are the repository's.
+SNAP="$(git rev-parse --git-path "nitsql-staged.$$")"
+trap 'rm -rf "$SNAP"' EXIT
+if ! git checkout-index --prefix="$SNAP/" -- "${STAGED[@]}"; then
+	note "Could not copy the staged files out, so they are not checked here; nitsql.yml checks the pull request."
+	exit 0
+fi
+
+note "Checking ${#STAGED[@]} staged .sql file(s)."
+JSON="$(cd "$SNAP" && "$PY" "$ANALYZER" --json -- "${STAGED[@]}" 2>/dev/null)"
+COUNTS="$(printf '%s' "$JSON" | "$PY" -c '
+import json, sys
+d = json.load(sys.stdin)
+s = d.get("severity_counts", {})
+print(d.get("total_violations", 0), *(s.get(k, 0) for k in ("CRITICAL", "HIGH", "MEDIUM", "LOW")))
+' 2>/dev/null)" || COUNTS=""
+read -r TOTAL CRITICAL HIGH MEDIUM LOW <<< "$COUNTS" || true
+
+case "${TOTAL:-}" in
+	'' | *[!0-9]*)
+		note "The analyzer gave no report, so the staged SQL is not checked here; nitsql.yml checks the pull request."
+		exit 0 ;;
+	0)
+		note "No findings."
+		exit 0 ;;
+esac
+
+(cd "$SNAP" && "$PY" "$ANALYZER" --fix -- "${STAGED[@]}") || true
+echo ""
+if [ "$CRITICAL" -gt 0 ]; then
+	note "Blocked: $CRITICAL CRITICAL finding(s) above. Fix them, stage the fix and commit again."
+	note "nitsql.yml fails the pull request on the same findings, so --no-verify only moves the failure to CI."
+	exit 1
+fi
+note "$TOTAL finding(s), none CRITICAL ($HIGH HIGH, $MEDIUM MEDIUM, $LOW LOW). The commit goes ahead."
+exit 0

@@ -1,0 +1,16 @@
+#!/bin/sh
+# commit-msg: credit Claude as a co-author of every commit made in this clone.
+#
+# git passes the message file as $1. The hook adds
+#   Co-authored-by: Claude <noreply@anthropic.com>
+# to the trailers, unless one of them already credits Claude (Claude Code writes its own, naming the
+# model). Only the trailer block counts, so a body line that quotes a trailer doesn't. Claude is a
+# co-author here, never the author: that stays whoever runs the commit.
+
+msg="$1"
+
+if git interpret-trailers --parse "$msg" |
+	grep -qiE '^co-authored-by:[[:space:]]*claude([[:space:]]|<|$)'; then
+	exit 0
+fi
+exec git interpret-trailers --in-place --trailer "Co-authored-by: Claude <noreply@anthropic.com>" "$msg"

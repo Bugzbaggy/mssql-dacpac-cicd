@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# sql-ready: git runs this before a push. It reminds about each pushed branch that hasn't been
+# through /pr-ready, and never blocks; the logic is in pr-ready-hook.sh.
+exec bash "$(dirname "$0")/pr-ready-hook.sh" pre-push "$@"
